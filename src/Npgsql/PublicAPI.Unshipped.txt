@@ -34,6 +34,20 @@ Npgsql.NpgsqlSlimDataSourceBuilder.UseRootCertificate(System.Security.Cryptograp
 Npgsql.NpgsqlSlimDataSourceBuilder.UseRootCertificateCallback(System.Func<System.Security.Cryptography.X509Certificates.X509Certificate2!>? rootCertificateCallback) -> Npgsql.NpgsqlSlimDataSourceBuilder!
 Npgsql.NpgsqlSlimDataSourceBuilder.UseSystemTextJson(System.Text.Json.JsonSerializerOptions? serializerOptions = null, System.Type![]? jsonbClrTypes = null, System.Type![]? jsonClrTypes = null) -> Npgsql.NpgsqlSlimDataSourceBuilder!
 Npgsql.NpgsqlSlimDataSourceBuilder.UseUserCertificateValidationCallback(System.Net.Security.RemoteCertificateValidationCallback! userCertificateValidationCallback) -> Npgsql.NpgsqlSlimDataSourceBuilder!
+NpgsqlTypes.NpgsqlCube
+NpgsqlTypes.NpgsqlCube.NpgsqlCube() -> void
+NpgsqlTypes.NpgsqlCube.Dimensions.get -> int
+NpgsqlTypes.NpgsqlCube.Point.get -> bool
+NpgsqlTypes.NpgsqlCube.Equals(NpgsqlTypes.NpgsqlCube other) -> bool
+NpgsqlTypes.NpgsqlCube.LowerLeft.get -> System.Collections.Generic.List<double>!
+NpgsqlTypes.NpgsqlCube.UpperRight.get -> System.Collections.Generic.List<double>!
+static NpgsqlTypes.NpgsqlCube.operator ==(NpgsqlTypes.NpgsqlCube x, NpgsqlTypes.NpgsqlCube y) -> bool
+static NpgsqlTypes.NpgsqlCube.operator !=(NpgsqlTypes.NpgsqlCube x, NpgsqlTypes.NpgsqlCube y) -> bool
+NpgsqlTypes.NpgsqlCube.NpgsqlCube(System.Collections.Generic.List<double>! lowerLeft, System.Collections.Generic.List<double>! upperRight) -> void
+override NpgsqlTypes.NpgsqlCube.Equals(object? obj) -> bool
+override NpgsqlTypes.NpgsqlCube.GetHashCode() -> int
+static NpgsqlTypes.NpgsqlCube.CreatePoint(params double[]! coords) -> NpgsqlTypes.NpgsqlCube
+static NpgsqlTypes.NpgsqlCube.CreatePoint(System.Collections.Generic.List<double>! coords) -> NpgsqlTypes.NpgsqlCube
 *REMOVED*static NpgsqlTypes.NpgsqlBox.Parse(string! s) -> NpgsqlTypes.NpgsqlBox
 *REMOVED*static NpgsqlTypes.NpgsqlCircle.Parse(string! s) -> NpgsqlTypes.NpgsqlCircle
 *REMOVED*static NpgsqlTypes.NpgsqlLine.Parse(string! s) -> NpgsqlTypes.NpgsqlLine
