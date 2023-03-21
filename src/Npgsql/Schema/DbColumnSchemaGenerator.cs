@@ -14,7 +14,7 @@ using Npgsql.Util;
 
 namespace Npgsql.Schema;
 
-class DbColumnSchemaGenerator
+sealed class DbColumnSchemaGenerator
 {
     readonly RowDescriptionMessage _rowDescription;
     readonly NpgsqlConnection _connection;
@@ -32,7 +32,7 @@ class DbColumnSchemaGenerator
     static string GenerateColumnsQuery(Version pgVersion, string columnFieldFilter) =>
         $@"SELECT
      typ.oid AS typoid, nspname, relname, attname, attrelid, attnum, attnotnull,
-     {(pgVersion.IsGreaterOrEqual(10, 0) ? "attidentity != ''" : "FALSE")} AS isidentity,
+     {(pgVersion.IsGreaterOrEqual(10) ? "attidentity != ''" : "FALSE")} AS isidentity,
      CASE WHEN typ.typtype = 'd' THEN typ.typtypmod ELSE atttypmod END AS typmod,
      CASE WHEN atthasdef THEN (SELECT pg_get_expr(adbin, cls.oid) FROM pg_attrdef WHERE adrelid = cls.oid AND adnum = attr.attnum) ELSE NULL END AS default,
      CASE WHEN col.is_updatable = 'YES' THEN true ELSE false END AS is_updatable,
@@ -46,7 +46,7 @@ class DbColumnSchemaGenerator
        SELECT * FROM pg_index
        WHERE pg_index.indrelid = cls.oid AND
              pg_index.indisunique AND
-             pg_index.{(pgVersion.IsGreaterOrEqual(11, 0) ? "indnkeyatts" : "indnatts")} = 1 AND
+             pg_index.{(pgVersion.IsGreaterOrEqual(11) ? "indnkeyatts" : "indnatts")} = 1 AND
              attnum = pg_index.indkey[0]
      ) AS isunique
 FROM pg_attribute AS attr
@@ -216,8 +216,11 @@ ORDER BY attnum";
         var defaultValueOrdinal = reader.GetOrdinal("default");
         column.DefaultValue = reader.IsDBNull(defaultValueOrdinal) ? null : reader.GetString(defaultValueOrdinal);
 
+        column.IsIdentity = !oldQueryMode && reader.GetBoolean(reader.GetOrdinal("isidentity"));
+
+        // Use a heuristic to discover old SERIAL columns
         column.IsAutoIncrement =
-            !oldQueryMode && reader.GetBoolean(reader.GetOrdinal("isidentity")) ||
+            column.IsIdentity == true ||
             column.DefaultValue != null && column.DefaultValue.StartsWith("nextval(", StringComparison.Ordinal);
 
         ColumnPostConfig(column, reader.GetInt32(reader.GetOrdinal("typmod")));

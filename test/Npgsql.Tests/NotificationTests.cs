@@ -3,6 +3,7 @@ using System;
 using System.Data;
 using System.Threading;
 using System.Threading.Tasks;
+using Npgsql.Internal;
 using static Npgsql.Tests.TestUtil;
 
 namespace Npgsql.Tests;
@@ -88,9 +89,9 @@ public class NotificationTests : TestBase
     [Test]
     public void Wait_with_prepended_message()
     {
-        using var _ = CreateTempPool(ConnectionString, out var connString);
-        using (OpenConnection(connString)) {}  // A DISCARD ALL is now prepended in the connection's write buffer
-        using var conn = OpenConnection(connString);
+        using var dataSource = CreateDataSource();
+        using (dataSource.OpenConnection()) {}  // A DISCARD ALL is now prepended in the connection's write buffer
+        using var conn = dataSource.OpenConnection();
         Assert.That(conn.Wait(100), Is.EqualTo(false));
     }
 
@@ -119,23 +120,23 @@ public class NotificationTests : TestBase
     }
 
     [Test]
-    public async Task Wait_with_keepalive()
+    public void Wait_with_keepalive()
     {
         var notify = GetUniqueIdentifier(nameof(NotificationTests));
 
-        var csb = new NpgsqlConnectionStringBuilder(ConnectionString)
+        using var dataSource = CreateDataSource(csb =>
         {
-            KeepAlive = 1,
-            Pooling = false
-        };
-        using var conn = OpenConnection(csb);
-        using var notifyingConn = OpenConnection();
+            csb.KeepAlive = 1;
+            csb.Pooling = false;
+        });
+        using var conn = dataSource.OpenConnection();
+        using var notifyingConn = dataSource.OpenConnection();
         conn.ExecuteNonQuery($"LISTEN {notify}");
         var notificationTask = Task.Delay(2000).ContinueWith(t => notifyingConn.ExecuteNonQuery($"NOTIFY {notify}"));
         conn.Wait();
         Assert.That(conn.ExecuteScalar("SELECT 1"), Is.EqualTo(1));
         // A safeguard against closing an active connection
-        await notificationTask;
+        notificationTask.GetAwaiter().GetResult();
         //Assert.That(TestLoggerSink.Records, Has.Some.With.Property("EventId").EqualTo(new EventId(NpgsqlEventId.Keepalive)));
     }
 
@@ -144,18 +145,18 @@ public class NotificationTests : TestBase
     {
         var notify = GetUniqueIdentifier(nameof(NotificationTests));
 
-        var csb = new NpgsqlConnectionStringBuilder(ConnectionString)
+        await using var dataSource = CreateDataSource(csb =>
         {
-            KeepAlive = 1,
-            Pooling = false
-        };
-        using var conn = OpenConnection(csb);
-        using var notifyingConn = OpenConnection();
-        conn.ExecuteNonQuery($"LISTEN {notify}");
+            csb.KeepAlive = 1;
+            csb.Pooling = false;
+        });
+        await using var conn = await dataSource.OpenConnectionAsync();
+        await using var notifyingConn = await dataSource.OpenConnectionAsync();
+        await conn.ExecuteNonQueryAsync($"LISTEN {notify}");
         var notificationTask = Task.Delay(2000).ContinueWith(t => notifyingConn.ExecuteNonQuery($"NOTIFY {notify}"));
         await conn.WaitAsync();
         //Assert.That(TestLoggerSink.Records, Has.Some.With.Property("EventId").EqualTo(new EventId(NpgsqlEventId.Keepalive)));
-        Assert.That(conn.ExecuteScalar("SELECT 1"), Is.EqualTo(1));
+        Assert.That(await conn.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1));
         // A safeguard against closing an active connection
         await notificationTask;
     }
@@ -183,8 +184,8 @@ public class NotificationTests : TestBase
     [Test]
     public void Wait_breaks_connection()
     {
-        using var _ = CreateTempPool(ConnectionString, out var connString);
-        using var conn = OpenConnection(connString);
+        using var dataSource = CreateDataSource();
+        using var conn = dataSource.OpenConnection();
         Task.Delay(1000).ContinueWith(t =>
         {
             using var conn2 = OpenConnection();
@@ -199,8 +200,8 @@ public class NotificationTests : TestBase
     [Test]
     public void WaitAsync_breaks_connection()
     {
-        using var _ = CreateTempPool(ConnectionString, out var connString);
-        using var conn = OpenConnection(ConnectionString);
+        using var dataSource = CreateDataSource();
+        using var conn = dataSource.OpenConnection();
         Task.Delay(1000).ContinueWith(t =>
         {
             using var conn2 = OpenConnection();
@@ -210,5 +211,21 @@ public class NotificationTests : TestBase
         var pgEx = Assert.ThrowsAsync<PostgresException>(async () => await conn.WaitAsync())!;
         Assert.That(pgEx.SqlState, Is.EqualTo(PostgresErrorCodes.AdminShutdown));
         Assert.That(conn.FullState, Is.EqualTo(ConnectionState.Broken));
+    }
+
+    [Test, IssueLink("https://github.com/npgsql/npgsql/issues/4911")]
+    public async Task Big_notice_while_loading_types()
+    {
+        await using var adminConn = await OpenConnectionAsync();
+        // Max notification payload is 8000
+        await using var dataSource = CreateDataSource(csb => csb.ReadBufferSize = 4096);
+        await using var conn = await dataSource.OpenConnectionAsync();
+
+        var notify = GetUniqueIdentifier(nameof(Big_notice_while_loading_types));
+        await conn.ExecuteNonQueryAsync($"LISTEN {notify}");
+        var payload = new string('a', 5000);
+        await adminConn.ExecuteNonQueryAsync($"NOTIFY {notify}, '{payload}'");
+
+        await conn.ReloadTypesAsync();
     }
 }

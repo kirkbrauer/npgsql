@@ -6,8 +6,10 @@ using Npgsql.BackendMessages;
 using Npgsql.Internal;
 using Npgsql.Internal.TypeHandlers;
 using Npgsql.Internal.TypeHandling;
+using Npgsql.NodaTime.Properties;
 using Npgsql.PostgresTypes;
 using NpgsqlTypes;
+using static Npgsql.NodaTime.Internal.NodaTimeUtils;
 
 namespace Npgsql.NodaTime.Internal;
 
@@ -22,7 +24,6 @@ public partial class DateRangeHandler : RangeHandler<LocalDate>, INpgsqlTypeHand
     }
 
     public override Type GetFieldType(FieldDescription? fieldDescription = null) => typeof(DateInterval);
-    public override Type GetProviderSpecificFieldType(FieldDescription? fieldDescription = null) => typeof(DateInterval);
 
     public override async ValueTask<object> ReadAsObject(NpgsqlReadBuffer buf, int len, bool async,
         FieldDescription? fieldDescription = null)
@@ -31,7 +32,13 @@ public partial class DateRangeHandler : RangeHandler<LocalDate>, INpgsqlTypeHand
     async ValueTask<DateInterval> INpgsqlTypeHandler<DateInterval>.Read(NpgsqlReadBuffer buf, int len, bool async, FieldDescription? fieldDescription)
     {
         var range = await Read(buf, len, async, fieldDescription);
-        return new(range.LowerBound, range.UpperBound - Period.FromDays(1));
+
+        var upperBound = range.UpperBound;
+
+        if (DisableDateTimeInfinityConversions || upperBound != LocalDate.MaxIsoValue)
+            upperBound -= Period.FromDays(1);
+
+        return new(range.LowerBound, upperBound);
     }
 
     public int ValidateAndGetLength(DateInterval value, ref NpgsqlLengthCache? lengthCache, NpgsqlParameter? parameter)

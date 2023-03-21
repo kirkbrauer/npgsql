@@ -68,5 +68,83 @@ namespace Npgsql.Properties {
                 return ResourceManager.GetString("CannotUseTrustServerCertificate", resourceCulture);
             }
         }
+        
+        internal static string EncryptionDisabled {
+            get {
+                return ResourceManager.GetString("EncryptionDisabled", resourceCulture);
+            }
+        }
+        
+        internal static string NoMultirangeTypeFound {
+            get {
+                return ResourceManager.GetString("NoMultirangeTypeFound", resourceCulture);
+            }
+        }
+        
+        internal static string NotSupportedOnDataSourceCommand {
+            get {
+                return ResourceManager.GetString("NotSupportedOnDataSourceCommand", resourceCulture);
+            }
+        }
+        
+        internal static string NotSupportedOnDataSourceBatch {
+            get {
+                return ResourceManager.GetString("NotSupportedOnDataSourceBatch", resourceCulture);
+            }
+        }
+        
+        internal static string CannotSetBothPasswordProviderAndPassword {
+            get {
+                return ResourceManager.GetString("CannotSetBothPasswordProviderAndPassword", resourceCulture);
+            }
+        }
+        
+        internal static string PasswordProviderMissing {
+            get {
+                return ResourceManager.GetString("PasswordProviderMissing", resourceCulture);
+            }
+        }
+        
+        internal static string ArgumentMustBePositive {
+            get {
+                return ResourceManager.GetString("ArgumentMustBePositive", resourceCulture);
+            }
+        }
+        
+        internal static string CannotSpecifyTargetSessionAttributes {
+            get {
+                return ResourceManager.GetString("CannotSpecifyTargetSessionAttributes", resourceCulture);
+            }
+        }
+        
+        internal static string CannotReadIntervalWithMonthsAsTimeSpan {
+            get {
+                return ResourceManager.GetString("CannotReadIntervalWithMonthsAsTimeSpan", resourceCulture);
+            }
+        }
+        
+        internal static string PositionalParameterAfterNamed {
+            get {
+                return ResourceManager.GetString("PositionalParameterAfterNamed", resourceCulture);
+            }
+        }
+        
+        internal static string CannotReadInfinityValue {
+            get {
+                return ResourceManager.GetString("CannotReadInfinityValue", resourceCulture);
+            }
+        }
+        
+        internal static string SyncAndAsyncConnectionInitializersRequired {
+            get {
+                return ResourceManager.GetString("SyncAndAsyncConnectionInitializersRequired", resourceCulture);
+            }
+        }
+        
+        internal static string CannotUseValidationRootCertificateCallbackWithUserCallback {
+            get {
+                return ResourceManager.GetString("CannotUseValidationRootCertificateCallbackWithUserCallback", resourceCulture);
+            }
+        }
     }
 }

@@ -10,6 +10,7 @@ using Microsoft.Extensions.Logging;
 using Npgsql.BackendMessages;
 using Npgsql.Internal;
 using Npgsql.PostgresTypes;
+using Npgsql.TypeMapping;
 using Npgsql.Util;
 using static Npgsql.Util.Statics;
 
@@ -21,7 +22,7 @@ namespace Npgsql;
 /// <summary>
 /// The default implementation of <see cref="INpgsqlDatabaseInfoFactory"/>, for standard PostgreSQL databases..
 /// </summary>
-class PostgresDatabaseInfoFactory : INpgsqlDatabaseInfoFactory
+sealed class PostgresDatabaseInfoFactory : INpgsqlDatabaseInfoFactory
 {
     /// <inheritdoc />
     public async Task<NpgsqlDatabaseInfo?> Load(NpgsqlConnector conn, NpgsqlTimeout timeout, bool async)
@@ -38,7 +39,7 @@ class PostgresDatabaseInfoFactory : INpgsqlDatabaseInfoFactory
 /// </summary>
 class PostgresDatabaseInfo : NpgsqlDatabaseInfo
 {
-    static readonly ILogger Logger = NpgsqlLoggingConfiguration.ConnectionLogger;
+    readonly ILogger _connectionLogger;
 
     /// <summary>
     /// The PostgreSQL types detected in the database.
@@ -77,8 +78,7 @@ class PostgresDatabaseInfo : NpgsqlDatabaseInfo
 
     internal PostgresDatabaseInfo(NpgsqlConnector conn)
         : base(conn.Host!, conn.Port, conn.Database!, conn.PostgresParameters["server_version"])
-    {
-    }
+        => _connectionLogger = conn.LoggingConfiguration.ConnectionLogger;
 
     /// <summary>
     /// Loads database information from the PostgreSQL database specified by <paramref name="conn"/>.
@@ -193,10 +193,6 @@ ORDER BY oid{(withEnumSortOrder ? ", enumsortorder" : "")};";
     /// <exception cref="ArgumentOutOfRangeException">Unknown typtype for type '{internalName}' in pg_type: {typeChar}.</exception>
     internal async Task<List<PostgresType>> LoadBackendTypes(NpgsqlConnector conn, NpgsqlTimeout timeout, bool async)
     {
-        var commandTimeout = 0;  // Default to infinity
-        if (timeout.IsSet)
-            commandTimeout = (int)timeout.CheckAndGetTimeLeft().TotalSeconds;
-
         var versionQuery = "SELECT version();";
         var loadTypesQuery = GenerateLoadTypesQuery(SupportsRangeTypes, SupportsMultirangeTypes, conn.Settings.LoadTableComposites);
         var loadCompositeTypesQuery = GenerateLoadCompositeTypesQuery(conn.Settings.LoadTableComposites);
@@ -303,7 +299,6 @@ ORDER BY oid{(withEnumSortOrder ? ", enumsortorder" : "")};";
         }
         await conn.Flush(async);
         var byOID = new Dictionary<uint, PostgresType>();
-        var buf = conn.ReadBuffer;
 
         // First read the PostgreSQL version
         Expect<RowDescriptionMessage>(await conn.ReadMessage(async), conn);
@@ -311,8 +306,10 @@ ORDER BY oid{(withEnumSortOrder ? ", enumsortorder" : "")};";
         // We read the message in non-sequential mode which buffers the whole message.
         // There is no need to ensure data within the message boundaries
         Expect<DataRowMessage>(await conn.ReadMessage(async), conn);
-        buf.Skip(2); // Column count
-        LongVersion = ReadNonNullableString(buf);
+        // Note that here and below we don't assign ReadBuffer to a variable
+        // because we might allocate oversize buffer
+        conn.ReadBuffer.Skip(2); // Column count
+        LongVersion = ReadNonNullableString(conn.ReadBuffer);
         Expect<CommandCompleteMessage>(await conn.ReadMessage(async), conn);
         if (isReplicationConnection)
             Expect<ReadyForQueryMessage>(await conn.ReadMessage(async), conn);
@@ -326,15 +323,15 @@ ORDER BY oid{(withEnumSortOrder ? ", enumsortorder" : "")};";
             if (msg is not DataRowMessage)
                 break;
 
-            buf.Skip(2); // Column count
-            var nspname = ReadNonNullableString(buf);
-            var oid = uint.Parse(ReadNonNullableString(buf), NumberFormatInfo.InvariantInfo);
+            conn.ReadBuffer.Skip(2); // Column count
+            var nspname = ReadNonNullableString(conn.ReadBuffer);
+            var oid = uint.Parse(ReadNonNullableString(conn.ReadBuffer), NumberFormatInfo.InvariantInfo);
             Debug.Assert(oid != 0);
-            var typname = ReadNonNullableString(buf);
-            var typtype = ReadNonNullableString(buf)[0];
-            var typnotnull = ReadNonNullableString(buf)[0] == 't';
-            var len = buf.ReadInt32();
-            var elemtypoid = len == -1 ? 0 : uint.Parse(buf.ReadString(len), NumberFormatInfo.InvariantInfo);
+            var typname = ReadNonNullableString(conn.ReadBuffer);
+            var typtype = ReadNonNullableString(conn.ReadBuffer)[0];
+            var typnotnull = ReadNonNullableString(conn.ReadBuffer)[0] == 't';
+            var len = conn.ReadBuffer.ReadInt32();
+            var elemtypoid = len == -1 ? 0 : uint.Parse(conn.ReadBuffer.ReadString(len), NumberFormatInfo.InvariantInfo);
 
             switch (typtype)
             {
@@ -348,7 +345,7 @@ ORDER BY oid{(withEnumSortOrder ? ", enumsortorder" : "")};";
                 Debug.Assert(elemtypoid > 0);
                 if (!byOID.TryGetValue(elemtypoid, out var elementPostgresType))
                 {
-                    Logger.LogTrace("Array type '{ArrayTypeName}' refers to unknown element with OID {ElementTypeOID}, skipping",
+                    _connectionLogger.LogTrace("Array type '{ArrayTypeName}' refers to unknown element with OID {ElementTypeOID}, skipping",
                         typname, elemtypoid);
                     continue;
                 }
@@ -363,7 +360,7 @@ ORDER BY oid{(withEnumSortOrder ? ", enumsortorder" : "")};";
                 Debug.Assert(elemtypoid > 0);
                 if (!byOID.TryGetValue(elemtypoid, out var subtypePostgresType))
                 {
-                    Logger.LogTrace("Range type '{RangeTypeName}' refers to unknown subtype with OID {ElementTypeOID}, skipping",
+                    _connectionLogger.LogTrace("Range type '{RangeTypeName}' refers to unknown subtype with OID {ElementTypeOID}, skipping",
                         typname, elemtypoid);
                     continue;
                 }
@@ -377,14 +374,14 @@ ORDER BY oid{(withEnumSortOrder ? ", enumsortorder" : "")};";
                 Debug.Assert(elemtypoid > 0);
                 if (!byOID.TryGetValue(elemtypoid, out var type))
                 {
-                    Logger.LogTrace("Multirange type '{MultirangeTypeName}' refers to unknown range with OID {ElementTypeOID}, skipping",
+                    _connectionLogger.LogTrace("Multirange type '{MultirangeTypeName}' refers to unknown range with OID {ElementTypeOID}, skipping",
                         typname, elemtypoid);
                     continue;
                 }
 
                 if (type is not PostgresRangeType rangePostgresType)
                 {
-                    Logger.LogTrace("Multirange type '{MultirangeTypeName}' refers to non-range type '{TypeName}', skipping",
+                    _connectionLogger.LogTrace("Multirange type '{MultirangeTypeName}' refers to non-range type '{TypeName}', skipping",
                         typname, type.Name);
                     continue;
                 }
@@ -407,7 +404,7 @@ ORDER BY oid{(withEnumSortOrder ? ", enumsortorder" : "")};";
                 Debug.Assert(elemtypoid > 0);
                 if (!byOID.TryGetValue(elemtypoid, out var basePostgresType))
                 {
-                    Logger.LogTrace("Domain type '{DomainTypeName}' refers to unknown base type with OID {ElementTypeOID}, skipping",
+                    _connectionLogger.LogTrace("Domain type '{DomainTypeName}' refers to unknown base type with OID {ElementTypeOID}, skipping",
                         typname, elemtypoid);
                     continue;
                 }
@@ -440,10 +437,10 @@ ORDER BY oid{(withEnumSortOrder ? ", enumsortorder" : "")};";
             if (msg is not DataRowMessage)
                 break;
 
-            buf.Skip(2); // Column count
-            var oid = uint.Parse(ReadNonNullableString(buf), NumberFormatInfo.InvariantInfo);
-            var attname = ReadNonNullableString(buf);
-            var atttypid = uint.Parse(ReadNonNullableString(buf), NumberFormatInfo.InvariantInfo);
+            conn.ReadBuffer.Skip(2); // Column count
+            var oid = uint.Parse(ReadNonNullableString(conn.ReadBuffer), NumberFormatInfo.InvariantInfo);
+            var attname = ReadNonNullableString(conn.ReadBuffer);
+            var atttypid = uint.Parse(ReadNonNullableString(conn.ReadBuffer), NumberFormatInfo.InvariantInfo);
 
             if (oid != currentOID)
             {
@@ -451,7 +448,7 @@ ORDER BY oid{(withEnumSortOrder ? ", enumsortorder" : "")};";
 
                 if (!byOID.TryGetValue(oid, out var type))  // See #2020
                 {
-                    Logger.LogWarning("Skipping composite type with OID {CompositeTypeOID} which was not found in pg_type", oid);
+                    _connectionLogger.LogWarning("Skipping composite type with OID {CompositeTypeOID} which was not found in pg_type", oid);
                     byOID.Remove(oid);
                     skipCurrent = true;
                     continue;
@@ -460,7 +457,7 @@ ORDER BY oid{(withEnumSortOrder ? ", enumsortorder" : "")};";
                 currentComposite = type as PostgresCompositeType;
                 if (currentComposite == null)
                 {
-                    Logger.LogWarning("Type {TypeName} was referenced as a composite type but is a {type}", type.Name, type.GetType());
+                    _connectionLogger.LogWarning("Type {TypeName} was referenced as a composite type but is a {type}", type.Name, type.GetType());
                     byOID.Remove(oid);
                     skipCurrent = true;
                     continue;
@@ -474,7 +471,7 @@ ORDER BY oid{(withEnumSortOrder ? ", enumsortorder" : "")};";
 
             if (!byOID.TryGetValue(atttypid, out var fieldType))  // See #2020
             {
-                Logger.LogWarning("Skipping composite type '{CompositeTypeName}' with field '{fieldName}' with type OID '{FieldTypeOID}', which could not be resolved to a PostgreSQL type.",
+                _connectionLogger.LogWarning("Skipping composite type '{CompositeTypeName}' with field '{fieldName}' with type OID '{FieldTypeOID}', which could not be resolved to a PostgreSQL type.",
                     currentComposite!.DisplayName, attname, atttypid);
                 byOID.Remove(oid);
                 skipCurrent = true;
@@ -502,16 +499,16 @@ ORDER BY oid{(withEnumSortOrder ? ", enumsortorder" : "")};";
                 if (msg is not DataRowMessage)
                     break;
 
-                buf.Skip(2); // Column count
-                var oid = uint.Parse(ReadNonNullableString(buf), NumberFormatInfo.InvariantInfo);
-                var enumlabel = ReadNonNullableString(buf);
+                conn.ReadBuffer.Skip(2); // Column count
+                var oid = uint.Parse(ReadNonNullableString(conn.ReadBuffer), NumberFormatInfo.InvariantInfo);
+                var enumlabel = ReadNonNullableString(conn.ReadBuffer);
                 if (oid != currentOID)
                 {
                     currentOID = oid;
 
                     if (!byOID.TryGetValue(oid, out var type))  // See #2020
                     {
-                        Logger.LogWarning("Skipping enum type with OID {OID} which was not found in pg_type", oid);
+                        _connectionLogger.LogWarning("Skipping enum type with OID {OID} which was not found in pg_type", oid);
                         byOID.Remove(oid);
                         skipCurrent = true;
                         continue;
@@ -520,7 +517,7 @@ ORDER BY oid{(withEnumSortOrder ? ", enumsortorder" : "")};";
                     currentEnum = type as PostgresEnumType;
                     if (currentEnum == null)
                     {
-                        Logger.LogWarning("Type type '{TypeName}' was referenced as an enum type but is a {Type}", type.Name, type.GetType());
+                        _connectionLogger.LogWarning("Type type '{TypeName}' was referenced as an enum type but is a {Type}", type.Name, type.GetType());
                         byOID.Remove(oid);
                         skipCurrent = true;
                         continue;

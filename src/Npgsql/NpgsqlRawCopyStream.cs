@@ -64,7 +64,7 @@ public sealed class NpgsqlRawCopyStream : Stream, ICancelable
         (byte)'\n', 255, (byte)'\r', (byte)'\n', 0
     };
 
-    static readonly ILogger Logger = NpgsqlLoggingConfiguration.CopyLogger;
+    readonly ILogger _copyLogger;
 
     #endregion
 
@@ -75,6 +75,7 @@ public sealed class NpgsqlRawCopyStream : Stream, ICancelable
         _connector = connector;
         _readBuf = connector.ReadBuffer;
         _writeBuf = connector.WriteBuffer;
+        _copyLogger = connector.LoggingConfiguration.CopyLogger;
     }
 
     internal async Task Init(string copyCommand, bool async, CancellationToken cancellationToken = default)
@@ -125,7 +126,7 @@ public sealed class NpgsqlRawCopyStream : Stream, ICancelable
     }
 
 #if NETSTANDARD2_0
-        public void Write(ReadOnlySpan<byte> buffer)
+    public void Write(ReadOnlySpan<byte> buffer)
 #else
     public override void Write(ReadOnlySpan<byte> buffer)
 #endif
@@ -164,7 +165,7 @@ public sealed class NpgsqlRawCopyStream : Stream, ICancelable
     }
 
 #if NETSTANDARD2_0
-        public ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+    public ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
 #else
     public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
 #endif
@@ -242,7 +243,7 @@ public sealed class NpgsqlRawCopyStream : Stream, ICancelable
     }
 
 #if NETSTANDARD2_0
-        public int Read(Span<byte> span)
+    public int Read(Span<byte> span)
 #else
     public override int Read(Span<byte> span)
 #endif
@@ -258,7 +259,7 @@ public sealed class NpgsqlRawCopyStream : Stream, ICancelable
     }
 
 #if NETSTANDARD2_0
-        public ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken)
+    public ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken)
 #else
     public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken)
 #endif
@@ -371,7 +372,6 @@ public sealed class NpgsqlRawCopyStream : Stream, ICancelable
             }
             catch (PostgresException e)
             {
-                _connector.EndUserAction();
                 Cleanup();
 
                 if (e.SqlState != PostgresErrorCodes.QueryCanceled)
@@ -391,7 +391,7 @@ public sealed class NpgsqlRawCopyStream : Stream, ICancelable
     protected override void Dispose(bool disposing) => DisposeAsync(disposing, false).GetAwaiter().GetResult();
 
 #if NETSTANDARD2_0
-        public ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
 #else
     public override ValueTask DisposeAsync()
 #endif
@@ -430,18 +430,17 @@ public sealed class NpgsqlRawCopyStream : Stream, ICancelable
                     }
                     catch (OperationCanceledException e) when (e.InnerException is PostgresException pg && pg.SqlState == PostgresErrorCodes.QueryCanceled)
                     {
-                        LogMessages.CopyOperationCancelled(Logger, _connector.Id);
+                        LogMessages.CopyOperationCancelled(_copyLogger, _connector.Id);
                     }
                     catch (Exception e)
                     {
-                        LogMessages.ExceptionWhenDisposingCopyOperation(Logger, _connector.Id, e);
+                        LogMessages.ExceptionWhenDisposingCopyOperation(_copyLogger, _connector.Id, e);
                     }
                 }
             }
         }
         finally
         {
-            _connector.EndUserAction();
             Cleanup();
         }
     }
@@ -450,7 +449,8 @@ public sealed class NpgsqlRawCopyStream : Stream, ICancelable
     void Cleanup()
     {
         Debug.Assert(!_isDisposed);
-        LogMessages.CopyOperationCompleted(Logger, _connector.Id);
+        LogMessages.CopyOperationCompleted(_copyLogger, _connector.Id);
+        _connector.EndUserAction();
         _connector.CurrentCopyOperation = null;
         _connector.Connection?.EndBindingScope(ConnectorBindingScope.Copy);
         _connector = null;
@@ -538,11 +538,11 @@ public sealed class NpgsqlCopyTextWriter : StreamWriter, ICancelable
     }
 
 #if NETSTANDARD2_0
-        public ValueTask DisposeAsync()
-        {
-            Dispose();
-            return default;
-        }
+    public ValueTask DisposeAsync()
+    {
+        Dispose();
+        return default;
+    }
 #endif
 }
 

@@ -7,6 +7,7 @@ using Microsoft.Extensions.Logging;
 using Npgsql.BackendMessages;
 using Npgsql.Internal;
 using Npgsql.Internal.TypeHandling;
+using Npgsql.Internal.TypeMapping;
 using Npgsql.TypeMapping;
 using NpgsqlTypes;
 using static Npgsql.Util.Statics;
@@ -23,7 +24,7 @@ public sealed class NpgsqlBinaryExporter : ICancelable
 
     NpgsqlConnector _connector;
     NpgsqlReadBuffer _buf;
-    ConnectorTypeMapper _typeMapper;
+    TypeMapper _typeMapper;
     bool _isConsumed, _isDisposed;
     int _leftToReadInDataMsg, _columnLen;
 
@@ -37,7 +38,7 @@ public sealed class NpgsqlBinaryExporter : ICancelable
 
     NpgsqlTypeHandler?[] _typeHandlerCache;
 
-    static readonly ILogger Logger = NpgsqlLoggingConfiguration.CopyLogger;
+    readonly ILogger _copyLogger;
 
     /// <summary>
     /// Current timeout
@@ -64,6 +65,7 @@ public sealed class NpgsqlBinaryExporter : ICancelable
         _columnLen = int.MinValue;   // Mark that the (first) column length hasn't been read yet
         _column = -1;
         _typeHandlerCache = null!;
+        _copyLogger = connector.LoggingConfiguration.CopyLogger;
     }
 
     internal async Task Init(string copyToCommand, bool async, CancellationToken cancellationToken = default)
@@ -158,7 +160,7 @@ public sealed class NpgsqlBinaryExporter : ICancelable
         if (_column == NumColumns)
             _leftToReadInDataMsg = Expect<CopyDataMessage>(await _connector.ReadMessage(async), _connector).Length;
         else if (_column != -1)
-            throw new InvalidOperationException("Already in the middle of a row");
+            ThrowHelper.ThrowInvalidOperationException("Already in the middle of a row");
 
         await _buf.Ensure(2, async);
         _leftToReadInDataMsg -= 2;
@@ -215,7 +217,7 @@ public sealed class NpgsqlBinaryExporter : ICancelable
         CheckDisposed();
 
         if (_column == -1 || _column == NumColumns)
-            throw new InvalidOperationException("Not reading a row");
+            ThrowHelper.ThrowInvalidOperationException("Not reading a row");
 
         var type = typeof(T);
         var handler = _typeHandlerCache[_column];
@@ -266,7 +268,7 @@ public sealed class NpgsqlBinaryExporter : ICancelable
     {
         CheckDisposed();
         if (_column == -1 || _column == NumColumns)
-            throw new InvalidOperationException("Not reading a row");
+            ThrowHelper.ThrowInvalidOperationException("Not reading a row");
 
         var handler = _typeHandlerCache[_column];
         if (handler == null)
@@ -371,7 +373,7 @@ public sealed class NpgsqlBinaryExporter : ICancelable
     void CheckDisposed()
     {
         if (_isDisposed)
-            throw new ObjectDisposedException(GetType().FullName, "The COPY operation has already ended.");
+            ThrowHelper.ThrowObjectDisposedException(nameof(NpgsqlBinaryExporter), "The COPY operation has already ended.");
     }
 
     #endregion
@@ -414,7 +416,7 @@ public sealed class NpgsqlBinaryExporter : ICancelable
 
         if (_isConsumed)
         {
-            LogMessages.BinaryCopyOperationCompleted(Logger, _rowsExported, _connector.Id);
+            LogMessages.BinaryCopyOperationCompleted(_copyLogger, _rowsExported, _connector.Id);
         }
         else if (!_connector.IsBroken)
         {
@@ -431,11 +433,11 @@ public sealed class NpgsqlBinaryExporter : ICancelable
             }
             catch (OperationCanceledException e) when (e.InnerException is PostgresException pg && pg.SqlState == PostgresErrorCodes.QueryCanceled)
             {
-                LogMessages.CopyOperationCancelled(Logger, _connector.Id);
+                LogMessages.CopyOperationCancelled(_copyLogger, _connector.Id);
             }
             catch (Exception e)
             {
-                LogMessages.ExceptionWhenDisposingCopyOperation(Logger, _connector.Id, e);
+                LogMessages.ExceptionWhenDisposingCopyOperation(_copyLogger, _connector.Id, e);
             }
         }
 

@@ -1,6 +1,7 @@
 using System;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Threading.Tasks;
 using NpgsqlTypes;
 using NUnit.Framework;
@@ -14,172 +15,158 @@ namespace Npgsql.Tests.Types;
 public class JsonTests : MultiplexingTestBase
 {
     [Test]
-    public async Task Roundtrip_string()
-    {
-        using var conn = await OpenConnectionAsync();
-        using var cmd = new NpgsqlCommand("SELECT @p1, @p2", conn);
-        const string value = @"{""Key"": ""Value""}";
-        cmd.Parameters.Add(new NpgsqlParameter("p1", NpgsqlDbType) { Value = value });
-        cmd.Parameters.Add(new NpgsqlParameter<string>("p2", NpgsqlDbType) { TypedValue = value });
-        using var reader = await cmd.ExecuteReaderAsync();
-        reader.Read();
-        for (var i = 0; i < 2; i++)
-        {
-            Assert.That(reader.GetString(i), Is.EqualTo(value));
-            Assert.That(reader.GetFieldType(i), Is.EqualTo(typeof(string)));
+    public async Task As_string()
+        => await AssertType(@"{""K"": ""V""}", @"{""K"": ""V""}", PostgresType, NpgsqlDbType, isDefaultForWriting: false);
 
-            using var textReader = reader.GetTextReader(i);
-            Assert.That(textReader.ReadToEnd(), Is.EqualTo(value));
-        }
+    [Test]
+    public async Task As_string_long()
+    {
+        await using var conn = CreateConnection();
+
+        var value = new StringBuilder()
+            .Append(@"{""K"": """)
+            .Append('x', conn.Settings.WriteBufferSize)
+            .Append(@"""}")
+            .ToString();
+
+        await AssertType(value, value, PostgresType, NpgsqlDbType, isDefaultForWriting: false);
     }
 
     [Test]
-    public async Task Roundtrip_string_long()
+    public async Task As_string_with_GetTextReader()
     {
-        using var conn = await OpenConnectionAsync();
-        using var cmd = new NpgsqlCommand("SELECT @p1, @p2", conn);
-        var sb = new StringBuilder();
-        sb.Append(@"{""Key"": """);
-        sb.Append('x', conn.Settings.WriteBufferSize);
-        sb.Append(@"""}");
-        var value = sb.ToString();
-        cmd.Parameters.Add(new NpgsqlParameter("p1", NpgsqlDbType) { Value = value });
-        cmd.Parameters.Add(new NpgsqlParameter<string>("p2", NpgsqlDbType) { TypedValue = value });
-        using var reader = await cmd.ExecuteReaderAsync();
-        reader.Read();
-        for (var i = 0; i < 2; i++)
-        {
-            Assert.That(reader.GetString(i), Is.EqualTo(value));
-            Assert.That(reader.GetFieldType(i), Is.EqualTo(typeof(string)));
-
-            using var textReader = reader.GetTextReader(i);
-            Assert.That(textReader.ReadToEnd(), Is.EqualTo(value));
-        }
-    }
-
-    [Test, IssueLink("https://github.com/npgsql/npgsql/issues/3085")]
-    public async Task Roundtrip_string_types()
-    {
-        var expected = "{\"p\":1}";
-        // If we serialize to JSONB, Postgres will not store the Json.NET formatting, and will add a space after ':'
-        var expectedString = NpgsqlDbType.Equals(NpgsqlDbType.Jsonb) ? "{\"p\": 1}"
-            : "{\"p\":1}";
-
-        using var conn = OpenConnection();
-        using var cmd = new NpgsqlCommand(@"SELECT @p1, @p2, @p3", conn);
-
-        cmd.Parameters.Add(new NpgsqlParameter<string>("p1", NpgsqlDbType) { Value = expected });
-        cmd.Parameters.Add(new NpgsqlParameter<char[]>("p2", NpgsqlDbType) { Value = expected.ToCharArray() });
-        cmd.Parameters.Add(new NpgsqlParameter<byte[]>("p3", NpgsqlDbType) { Value = Encoding.ASCII.GetBytes(expected) });
-
+        await using var conn = await OpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand($@"SELECT '{{""K"": ""V""}}'::{PostgresType}", conn);
         await using var reader = await cmd.ExecuteReaderAsync();
         reader.Read();
-        Assert.That(reader.GetFieldValue<string>(0), Is.EqualTo(expectedString));
-        Assert.That(reader.GetFieldValue<char[]>(1), Is.EqualTo(expectedString.ToCharArray()));
-        Assert.That(reader.GetFieldValue<byte[]>(2), Is.EqualTo(Encoding.ASCII.GetBytes(expectedString)));
-    }
-
-    [Test, Ignore("INpgsqlTypeHandler<ArraySegment<char>>.Read currently not yet implemented in TextHandler")]
-    public async Task Roundtrip_ArraySegment()
-    {
-        var expected = "{\"p\":1}";
-        // If we serialize to JSONB, Postgres will not store the Json.NET formatting, and will add a space after ':'
-        var expectedString = NpgsqlDbType.Equals(NpgsqlDbType.Jsonb) ? "{\"p\": 1}"
-            : "{\"p\":1}";
-
-        using var conn = OpenConnection();
-        using var cmd = new NpgsqlCommand(@"SELECT @p1", conn);
-
-        cmd.Parameters.Add(new NpgsqlParameter<ArraySegment<char>>("p1", NpgsqlDbType) { Value = new ArraySegment<char>(expected.ToCharArray()) });
-
-        await using var reader = await cmd.ExecuteReaderAsync();
-        reader.Read();
-        Assert.That(reader.GetFieldValue<ArraySegment<char>>(0), Is.EqualTo(expectedString));
-    }
-
-
-    [Test]
-    public async Task Read_JsonDocument()
-    {
-        using var conn = await OpenConnectionAsync();
-        using var cmd = new NpgsqlCommand("SELECT @p", conn);
-        var value = @"{""Date"":""2019-09-01T00:00:00"",""TemperatureC"":10,""Summary"":""Partly cloudy""}";
-        cmd.Parameters.Add(new NpgsqlParameter("p", NpgsqlDbType) { Value = value });
-        using var reader = await cmd.ExecuteReaderAsync();
-        reader.Read();
-        Assert.That(reader.GetDataTypeName(0), Is.EqualTo(PostgresType));
-        var root = reader.GetFieldValue<JsonDocument>(0).RootElement;
-        Assert.That(root.GetProperty("Date").GetDateTime(), Is.EqualTo(new DateTime(2019, 9, 1)));
-        Assert.That(root.GetProperty("Summary").GetString(), Is.EqualTo("Partly cloudy"));
-        Assert.That(root.GetProperty("TemperatureC").GetInt32(), Is.EqualTo(10));
+        using var textReader = await reader.GetTextReaderAsync(0);
+        Assert.That(await textReader.ReadToEndAsync(), Is.EqualTo(@"{""K"": ""V""}"));
     }
 
     [Test]
-    public async Task Write_JsonDocument()
-    {
-        using var conn = await OpenConnectionAsync();
-        using var cmd = new NpgsqlCommand("SELECT @p1, @p2", conn);
-        var value = JsonDocument.Parse(@"{""Date"": ""2019-09-01T00:00:00"", ""Summary"": ""Partly cloudy"", ""TemperatureC"": 10}");
-        cmd.Parameters.Add(new NpgsqlParameter("p1", NpgsqlDbType) { Value = value });
-        cmd.Parameters.Add(new NpgsqlParameter<JsonDocument>("p2", NpgsqlDbType) { TypedValue = value });
-        if (IsJsonb)
-        {
-            cmd.CommandText += ", @p3";
-            cmd.Parameters.AddWithValue("p3", value);
-        }
+    public async Task As_char_array()
+        => await AssertType(@"{""K"": ""V""}".ToCharArray(), @"{""K"": ""V""}", PostgresType, NpgsqlDbType, isDefault: false);
 
-        using var reader = await cmd.ExecuteReaderAsync();
-        reader.Read();
-        for (var i = 0; i < reader.FieldCount; i++)
-        {
-            // Warning: in theory jsonb order and whitespace may change across versions
-            Assert.That(reader.GetString(0), Is.EqualTo(IsJsonb
+    [Test]
+    public async Task As_bytes()
+        => await AssertType(@"{""K"": ""V""}"u8.ToArray(), @"{""K"": ""V""}", PostgresType, NpgsqlDbType, isDefault: false);
+
+    [Test]
+    public async Task Write_as_ReadOnlyMemory_of_byte()
+        => await AssertTypeWrite(new ReadOnlyMemory<byte>(@"{""K"": ""V""}"u8.ToArray()), @"{""K"": ""V""}", PostgresType, NpgsqlDbType,
+            isDefault: false);
+
+    [Test]
+    public async Task Write_as_ArraySegment_of_char()
+        => await AssertTypeWrite(new ArraySegment<char>(@"{""K"": ""V""}".ToCharArray()), @"{""K"": ""V""}", PostgresType, NpgsqlDbType,
+            isDefault: false);
+
+    [Test]
+    public async Task As_JsonDocument()
+        => await AssertType(
+            JsonDocument.Parse(@"{""K"": ""V""}"),
+            IsJsonb ? @"{""K"": ""V""}" : @"{""K"":""V""}",
+            PostgresType,
+            NpgsqlDbType,
+            isDefault: false,
+            comparer: (x, y) => x.RootElement.GetProperty("K").GetString() == y.RootElement.GetProperty("K").GetString());
+
+    [Test]
+    public async Task As_JsonDocument_supported_only_with_SystemTextJson()
+    {
+        await using var slimDataSource = new NpgsqlSlimDataSourceBuilder(ConnectionString).Build();
+
+        await AssertTypeUnsupported(
+            JsonDocument.Parse(@"{""K"": ""V""}"),
+            @"{""K"": ""V""}",
+            PostgresType,
+            slimDataSource);
+    }
+
+#if NET6_0_OR_GREATER
+    [Test]
+    public Task Roundtrip_JsonObject()
+        => AssertType(
+            new JsonObject { ["Bar"] = 8 },
+            IsJsonb ? @"{""Bar"": 8}" : @"{""Bar"":8}",
+            PostgresType,
+            NpgsqlDbType,
+            // By default we map JsonObject to jsonb
+            isDefaultForWriting: IsJsonb,
+            isDefaultForReading: false,
+            isNpgsqlDbTypeInferredFromClrType: false,
+            comparer: (x, y) => x.ToString() == y.ToString());
+
+    [Test]
+    public Task Roundtrip_JsonArray()
+        => AssertType(
+            new JsonArray { 1, 2, 3 },
+            IsJsonb ? "[1, 2, 3]" : "[1,2,3]",
+            PostgresType,
+            NpgsqlDbType,
+            // By default we map JsonArray to jsonb
+            isDefaultForWriting: IsJsonb,
+            isDefaultForReading: false,
+            isNpgsqlDbTypeInferredFromClrType: false,
+            comparer: (x, y) => x.ToString() == y.ToString());
+#endif
+
+    [Test]
+    public async Task As_poco()
+        => await AssertType(
+            new WeatherForecast
+            {
+                Date = new DateTime(2019, 9, 1),
+                Summary = "Partly cloudy",
+                TemperatureC = 10
+            },
+            IsJsonb
                 ? @"{""Date"": ""2019-09-01T00:00:00"", ""Summary"": ""Partly cloudy"", ""TemperatureC"": 10}"
-                : @"{""Date"":""2019-09-01T00:00:00"",""Summary"":""Partly cloudy"",""TemperatureC"":10}"));
-        }
-    }
+                : @"{""Date"":""2019-09-01T00:00:00"",""TemperatureC"":10,""Summary"":""Partly cloudy""}",
+            PostgresType,
+            NpgsqlDbType,
+            isDefault: false);
 
     [Test]
-    public async Task Write_object()
+    public async Task As_poco_long()
     {
-        using var conn = await OpenConnectionAsync();
-        using var cmd = new NpgsqlCommand("SELECT @p1, @p2", conn);
-        var value = new WeatherForecast
-        {
-            Date = new DateTime(2019, 9, 1),
-            Summary = "Partly cloudy",
-            TemperatureC = 10
-        };
-        cmd.Parameters.Add(new NpgsqlParameter("p1", NpgsqlDbType) { Value = value });
-        cmd.Parameters.Add(new NpgsqlParameter<WeatherForecast>("p2", NpgsqlDbType) { TypedValue = value });
-        using var reader = await cmd.ExecuteReaderAsync();
-        reader.Read();
-        for (var i = 0; i < 2; i++)
-        {
+        using var conn = CreateConnection();
+        var bigString = new string('x', Math.Max(conn.Settings.ReadBufferSize, conn.Settings.WriteBufferSize));
+
+        await AssertType(
+            new WeatherForecast
+            {
+                Date = new DateTime(2019, 9, 1),
+                Summary = bigString,
+                TemperatureC = 10
+            },
             // Warning: in theory jsonb order and whitespace may change across versions
-            Assert.That(reader.GetString(0), Is.EqualTo(IsJsonb
-                ? @"{""Date"": ""2019-09-01T00:00:00"", ""Summary"": ""Partly cloudy"", ""TemperatureC"": 10}"
-                : @"{""Date"":""2019-09-01T00:00:00"",""TemperatureC"":10,""Summary"":""Partly cloudy""}"));
-        }
+            IsJsonb
+                ? @"{""Date"": ""2019-09-01T00:00:00"", ""Summary"": """ + bigString + @""", ""TemperatureC"": 10}"
+                : @"{""Date"":""2019-09-01T00:00:00"",""TemperatureC"":10,""Summary"":""" + bigString + @"""}",
+            PostgresType,
+            NpgsqlDbType,
+            isDefault: false);
     }
 
     [Test]
-    public async Task Read_object()
+    public async Task As_poco_supported_only_with_SystemTextJson()
     {
-        using var conn = await OpenConnectionAsync();
-        using var cmd = new NpgsqlCommand("SELECT @p", conn);
-        var value = @"{""Date"":""2019-09-01T00:00:00"",""TemperatureC"":10,""Summary"":""Partly cloudy""}";
-        cmd.Parameters.Add(new NpgsqlParameter("p", NpgsqlDbType) { Value = value });
-        using var reader = await cmd.ExecuteReaderAsync();
-        reader.Read();
-        Assert.That(reader.GetDataTypeName(0), Is.EqualTo(PostgresType));
-        var actual = reader.GetFieldValue<WeatherForecast>(0);
-        Assert.That(actual.Date, Is.EqualTo(new DateTime(2019, 9, 1)));
-        Assert.That(actual.Summary, Is.EqualTo("Partly cloudy"));
-        Assert.That(actual.TemperatureC, Is.EqualTo(10));
+        await using var slimDataSource = new NpgsqlSlimDataSourceBuilder(ConnectionString).Build();
+
+        await AssertTypeUnsupported(
+            new WeatherForecast
+            {
+                Date = new DateTime(2019, 9, 1),
+                Summary = "Partly cloudy",
+                TemperatureC = 10
+            },
+            @"{""Date"": ""2019-09-01T00:00:00"", ""Summary"": ""Partly cloudy"", ""TemperatureC"": 10}",
+            PostgresType,
+            slimDataSource);
     }
 
-    class WeatherForecast
+    record WeatherForecast
     {
         public DateTime Date { get; set; }
         public int TemperatureC { get; set; }
@@ -192,24 +179,107 @@ public class JsonTests : MultiplexingTestBase
     [IssueLink("https://github.com/npgsql/efcore.pg/issues/1082")]
     public async Task Can_read_two_json_documents()
     {
-        using var conn = await OpenConnectionAsync();
+        await using var conn = await OpenConnectionAsync();
 
         JsonDocument car;
-        using (var cmd = new NpgsqlCommand(@"SELECT '{""key"" : ""foo""}'::jsonb", conn))
-        using (var reader = await cmd.ExecuteReaderAsync())
+        await using (var cmd = new NpgsqlCommand(@"SELECT '{""key"" : ""foo""}'::jsonb", conn))
+        await using (var reader = await cmd.ExecuteReaderAsync())
         {
             reader.Read();
             car = reader.GetFieldValue<JsonDocument>(0);
         }
 
-        using (var cmd = new NpgsqlCommand(@"SELECT '{""key"" : ""bar""}'::jsonb", conn))
-        using (var reader = await cmd.ExecuteReaderAsync())
+        await using (var cmd = new NpgsqlCommand(@"SELECT '{""key"" : ""bar""}'::jsonb", conn))
+        await using (var reader = await cmd.ExecuteReaderAsync())
         {
             reader.Read();
             reader.GetFieldValue<JsonDocument>(0);
         }
 
         Assert.That(car.RootElement.GetProperty("key").GetString(), Is.EqualTo("foo"));
+    }
+
+#if NET6_0_OR_GREATER
+    [Test]
+    [IssueLink("https://github.com/npgsql/npgsql/issues/4537")]
+    public async Task Write_jsonobject_array_without_npgsqldbtype()
+    {
+        // By default we map JsonObject to jsonb
+        if (!IsJsonb)
+            return;
+
+        await using var conn = await OpenConnectionAsync();
+        var tableName = await TestUtil.CreateTempTable(conn, "key SERIAL PRIMARY KEY, ingredients json[]");
+
+        await using var cmd = new NpgsqlCommand { Connection = conn };
+
+        var jsonObject1 = new JsonObject
+        {
+            { "name", "value1" },
+            { "amount", 1 },
+            { "unit", "ml" }
+        };
+
+        var jsonObject2 = new JsonObject
+        {
+            { "name", "value2" },
+            { "amount", 2 },
+            { "unit", "g" }
+        };
+
+        cmd.CommandText = $"INSERT INTO {tableName} (ingredients) VALUES (@p)";
+        cmd.Parameters.Add(new("p", new[] { jsonObject1, jsonObject2 }));
+        await cmd.ExecuteNonQueryAsync();
+    }
+#endif
+
+    [Test]
+    public async Task Custom_JsonSerializerOptions()
+    {
+        var dataSourceBuilder = CreateDataSourceBuilder();
+        dataSourceBuilder.UseSystemTextJson(new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+        await using var dataSource = dataSourceBuilder.Build();
+
+        await AssertTypeWrite(
+            dataSource,
+            new WeatherForecast
+            {
+                Date = new DateTime(2019, 9, 1),
+                Summary = "Partly cloudy",
+                TemperatureC = 10
+            },
+            IsJsonb
+                ? @"{""date"": ""2019-09-01T00:00:00"", ""summary"": ""Partly cloudy"", ""temperatureC"": 10}"
+                : @"{""date"":""2019-09-01T00:00:00"",""temperatureC"":10,""summary"":""Partly cloudy""}",
+            PostgresType,
+            NpgsqlDbType,
+            isDefault: false);
+    }
+
+    [Test]
+    public async Task Poco_default_mapping()
+    {
+        var dataSourceBuilder = CreateDataSourceBuilder();
+        if (IsJsonb)
+            dataSourceBuilder.UseSystemTextJson(jsonbClrTypes: new[] { typeof(WeatherForecast) });
+        else
+            dataSourceBuilder.UseSystemTextJson(jsonClrTypes: new[] { typeof(WeatherForecast) });
+        await using var dataSource = dataSourceBuilder.Build();
+
+        await AssertTypeWrite(
+            dataSource,
+            new WeatherForecast
+            {
+                Date = new DateTime(2019, 9, 1),
+                Summary = "Partly cloudy",
+                TemperatureC = 10
+            },
+            IsJsonb
+                ? @"{""Date"": ""2019-09-01T00:00:00"", ""Summary"": ""Partly cloudy"", ""TemperatureC"": 10}"
+                : @"{""Date"":""2019-09-01T00:00:00"",""TemperatureC"":10,""Summary"":""Partly cloudy""}",
+            PostgresType,
+            NpgsqlDbType,
+            isNpgsqlDbTypeInferredFromClrType: false);
     }
 
     public JsonTests(MultiplexingMode multiplexingMode, NpgsqlDbType npgsqlDbType)

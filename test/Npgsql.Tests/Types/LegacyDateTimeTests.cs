@@ -49,14 +49,14 @@ public class LegacyDateTimeTests : TestBase
             isDefaultForWriting: false);
     }
 
-    protected override async ValueTask<NpgsqlConnection> OpenConnectionAsync(string? connectionString = null)
+    protected override async ValueTask<NpgsqlConnection> OpenConnectionAsync()
     {
-        var conn = await base.OpenConnectionAsync(connectionString);
+        var conn = await base.OpenConnectionAsync();
         await conn.ExecuteNonQueryAsync("SET TimeZone='Europe/Berlin'");
         return conn;
     }
 
-    protected override NpgsqlConnection OpenConnection(string? connectionString = null)
+    protected override NpgsqlConnection OpenConnection()
         => throw new NotSupportedException();
 
     [OneTimeSetUp]
@@ -65,8 +65,8 @@ public class LegacyDateTimeTests : TestBase
 #if DEBUG
         LegacyTimestampBehavior = true;
 #else
-            Assert.Ignore(
-                "Legacy DateTime tests rely on the Npgsql.EnableLegacyTimestampBehavior AppContext switch and can only be run in DEBUG builds");
+        Assert.Ignore(
+            "Legacy DateTime tests rely on the Npgsql.EnableLegacyTimestampBehavior AppContext switch and can only be run in DEBUG builds");
 #endif
     }
 

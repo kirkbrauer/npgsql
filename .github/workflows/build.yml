@@ -10,11 +10,12 @@ on:
   pull_request:
 
 env:
-  dotnet_sdk_version: '6.0.x'
+  dotnet_sdk_version: '8.0.100-preview.2.23157.25'
   postgis_version: 3
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
-  # Hack to support latest prerelease dotnet SDK, https://github.com/dotnet/installer/issues/12230#issuecomment-936348246
-  MSBuildEnableWorkloadResolver: false
+  # Windows comes with PG pre-installed, and defines the PGPASSWORD environment variable. Remove it as it interferes
+  # with some of our tests
+  PGPASSWORD: ""
 
 jobs:
   build:
@@ -23,26 +24,27 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-20.04, windows-2019]
-        pg_major: [14, 13, 12, 11, 10]
+        os: [ubuntu-22.04, windows-2022]
+        pg_major: [15, 14, 13, 12, 11, 10]
         config: [Release]
-        test_tfm: [net6.0]
+        test_tfm: [net8.0]
         include:
-          - os: ubuntu-20.04
-            pg_major: 14
+          - os: ubuntu-22.04
+            pg_major: 15
             config: Debug
-            test_tfm: net6.0
-          - os: ubuntu-20.04
-            pg_major: 14
+            test_tfm: net8.0
+          - os: ubuntu-22.04
+            pg_major: 15
             config: Release
             test_tfm: netcoreapp3.1
-          - os: macos-11
+          - os: macos-12
             pg_major: 14
             config: Release
-            test_tfm: net6.0
-#          - os: ubuntu-20.04
-#            pg_major: 14
+            test_tfm: net8.0
+#          - os: ubuntu-22.04
+#            pg_major: 15
 #            config: Release
+#            test_tfm: net8.0
 #            pg_prerelease: 'PG Prerelease'
 
     outputs:
@@ -62,7 +64,7 @@ jobs:
             ${{ runner.os }}-nuget-
 
       - name: Setup .NET Core SDK
-        uses: actions/setup-dotnet@v2
+        uses: actions/setup-dotnet@v3.0.3
         with:
           dotnet-version: |
             ${{ env.dotnet_sdk_version }}
@@ -78,8 +80,10 @@ jobs:
           # First uninstall any PostgreSQL installed on the image
           dpkg-query -W --showformat='${Package}\n' 'postgresql-*' | xargs sudo dpkg -P postgresql
 
+          # Import the repository signing key
           wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
-          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt/ focal-pgdg main 14" >> /etc/apt/sources.list.d/pgdg.list'
+
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt/ jammy-pgdg main ${{ matrix.pg_major }}" >> /etc/apt/sources.list.d/pgdg.list'
           sudo apt-get update -qq
           sudo apt-get install -qq postgresql-${{ matrix.pg_major }}
           export PGDATA=/etc/postgresql/${{ matrix.pg_major }}/main
@@ -103,6 +107,7 @@ jobs:
             sudo sed -i "s|unix_socket_directories = '/var/run/postgresql'|unix_socket_directories = '/var/run/postgresql, @/npgsql_unix'|" $PGDATA/postgresql.conf
           fi
 
+          sudo sed -i 's/max_connections = 100/max_connections = 500/' $PGDATA/postgresql.conf
           sudo sed -i 's/#ssl = off/ssl = on/' $PGDATA/postgresql.conf
           sudo sed -i "s|ssl_cert_file =|ssl_cert_file = '$PGDATA/server.crt' #|" $PGDATA/postgresql.conf
           sudo sed -i "s|ssl_key_file =|ssl_key_file = '$PGDATA/server.key' #|" $PGDATA/postgresql.conf
@@ -113,6 +118,8 @@ jobs:
           sudo sed -i 's/#wal_sender_timeout =/wal_sender_timeout = 3s #/' $PGDATA/postgresql.conf
           sudo sed -i "s/#synchronous_standby_names =/synchronous_standby_names = 'npgsql_test_sync_standby' #/" $PGDATA/postgresql.conf
           sudo sed -i "s/#synchronous_commit =/synchronous_commit = local #/" $PGDATA/postgresql.conf
+          sudo sed -i "s/#max_prepared_transactions = 0/max_prepared_transactions = 100/" $PGDATA/postgresql.conf
+
           # Disable trust authentication, requiring MD5 passwords - some tests must fail if a password isn't provided.
           sudo sh -c "echo 'local all all trust' > $PGDATA/pg_hba.conf"
           sudo sh -c "echo 'host all npgsql_tests_scram all scram-sha-256' >> $PGDATA/pg_hba.conf"
@@ -179,6 +186,7 @@ jobs:
           # Start PostgreSQL
           pgsql/bin/initdb -D pgsql/PGDATA -E UTF8 -U postgres
           SOCKET_DIR=$(echo "$LOCALAPPDATA\Temp" | sed 's|\\|/|g')
+          sed -i "s|max_connections = 100|max_connections = 500|" pgsql/PGDATA/postgresql.conf
           sed -i "s|#unix_socket_directories = ''|unix_socket_directories = '$SOCKET_DIR'|" pgsql/PGDATA/postgresql.conf
           sed -i "s|#wal_level =|wal_level = logical #|" pgsql/PGDATA/postgresql.conf
           sed -i "s|#max_wal_senders =|max_wal_senders = 50 #|" pgsql/PGDATA/postgresql.conf
@@ -186,6 +194,7 @@ jobs:
           sed -i "s|#wal_sender_timeout =|wal_sender_timeout = 3s #|" pgsql/PGDATA/postgresql.conf
           sed -i "s|#synchronous_standby_names =|synchronous_standby_names = 'npgsql_test_sync_standby' #|" pgsql/PGDATA/postgresql.conf
           sed -i "s|#synchronous_commit =|synchronous_commit = local #|" pgsql/PGDATA/postgresql.conf
+          sed -i "s|#max_prepared_transactions = 0|max_prepared_transactions = 100|" pgsql/PGDATA/postgresql.conf
           pgsql/bin/pg_ctl -D pgsql/PGDATA -l logfile -o '-c ssl=true -c ssl_cert_file=../server.crt -c ssl_key_file=../server.key' start
 
           # Create npgsql_tests user with md5 password 'npgsql_tests'
@@ -223,13 +232,15 @@ jobs:
       - name: Start PostgreSQL ${{ matrix.pg_major }} (MacOS)
         if: startsWith(matrix.os, 'macos')
         run: |
-            PGDATA=/usr/local/var/postgres
+            PGDATA=/usr/local/var/postgresql@${{ matrix.pg_major }}
 
             sudo sed -i '' 's/#ssl = off/ssl = on/' $PGDATA/postgresql.conf
             cp $GITHUB_WORKSPACE/.build/{server.crt,server.key} $PGDATA
             chmod 600 $PGDATA/{server.crt,server.key}
+            
+            postgreService=$(brew services list | grep -oe "postgresql\S*")
 
-            brew services start postgresql
+            brew services start $postgreService
             echo "Check PostgreSQL service is running"
             i=5
             COMMAND='pg_isready'
@@ -251,6 +262,7 @@ jobs:
             psql -c "CREATE USER npgsql_tests_ssl SUPERUSER PASSWORD 'npgsql_tests_ssl'" postgres
             psql -c "CREATE USER npgsql_tests_nossl SUPERUSER PASSWORD 'npgsql_tests_nossl'" postgres
 
+            sudo sed -i '' 's/max_connections = 100/max_connections = 500/' $PGDATA/postgresql.conf
             sudo sed -i '' 's/#password_encryption = md5/password_encryption = scram-sha-256/' $PGDATA/postgresql.conf
             sudo sed -i '' 's/#wal_level =/wal_level = logical #/' $PGDATA/postgresql.conf
             sudo sed -i '' 's/#max_wal_senders =/max_wal_senders = 50 #/' $PGDATA/postgresql.conf
@@ -258,6 +270,7 @@ jobs:
             sudo sed -i '' 's/#wal_sender_timeout =/wal_sender_timeout = 3s #/' $PGDATA/postgresql.conf
             sudo sed -i '' "s/#synchronous_standby_names =/synchronous_standby_names = 'npgsql_test_sync_standby' #/" $PGDATA/postgresql.conf
             sudo sed -i '' "s/#synchronous_commit =/synchronous_commit = local #/" $PGDATA/postgresql.conf
+            sudo sed -i '' "s/#max_prepared_transactions = 0/max_prepared_transactions = 100/" $PGDATA/postgresql.conf
             # Disable trust authentication, requiring MD5 passwords - some tests must fail if a password isn't provided.
             sudo sh -c "echo 'local all all trust' > $PGDATA/pg_hba.conf"
             sudo sh -c "echo 'hostssl all npgsql_tests_ssl all md5' >> $PGDATA/pg_hba.conf"
@@ -268,7 +281,7 @@ jobs:
             sudo sh -c "echo 'host all all all md5' >> $PGDATA/pg_hba.conf"
             sudo sh -c "echo 'host replication all all md5' >> $PGDATA/pg_hba.conf"
 
-            brew services restart postgresql
+            brew services restart $postgreService
             echo "Check PostgreSQL service is running"
             i=5
             COMMAND='pg_isready'
@@ -287,7 +300,9 @@ jobs:
 
       # TODO: Once test/Npgsql.Specification.Tests work, switch to just testing on the solution
       - name: Test
-        run: dotnet test -c ${{ matrix.config }} -f ${{ matrix.test_tfm }} test/Npgsql.Tests --logger "GitHubActions;report-warnings=false"
+        run: |
+            dotnet test -c ${{ matrix.config }} -f ${{ matrix.test_tfm }} test/Npgsql.Tests --logger "GitHubActions;report-warnings=false"
+            dotnet test -c ${{ matrix.config }} -f ${{ matrix.test_tfm }} test/Npgsql.DependencyInjection.Tests --logger "GitHubActions;report-warnings=false"
         shell: bash
 
       - name: Test Plugins
@@ -314,7 +329,7 @@ jobs:
 
   publish-ci:
     needs: build
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     if: github.event_name == 'push' && github.repository == 'npgsql/npgsql'
     environment: myget
 
@@ -331,12 +346,12 @@ jobs:
             ${{ runner.os }}-nuget-
 
       - name: Setup .NET Core SDK
-        uses: actions/setup-dotnet@v2
+        uses: actions/setup-dotnet@v3.0.3
         with:
           dotnet-version: ${{ env.dotnet_sdk_version }}
 
       - name: Pack
-        run: dotnet pack Npgsql.sln --configuration Release --output nupkgs --version-suffix "ci.$(date -u +%Y%m%dT%H%M%S)+sha.${GITHUB_SHA:0:9}" -p:ContinuousIntegrationBuild=true
+        run: dotnet pack Npgsql.sln --configuration Release --property:PackageOutputPath="$PWD/nupkgs" --version-suffix "ci.$(date -u +%Y%m%dT%H%M%S)+sha.${GITHUB_SHA:0:9}" -p:ContinuousIntegrationBuild=true
 
       - name: Upload artifacts (nupkg)
         uses: actions/upload-artifact@v3
@@ -356,7 +371,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     if: github.event_name == 'push' && startsWith(github.repository, 'npgsql/') && needs.build.outputs.is_release == 'true'
     environment: nuget.org
 
@@ -365,12 +380,12 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Setup .NET Core SDK
-        uses: actions/setup-dotnet@v2
+        uses: actions/setup-dotnet@v3.0.3
         with:
           dotnet-version: ${{ env.dotnet_sdk_version }}
 
       - name: Pack
-        run: dotnet pack --configuration Release --output nupkgs -p:ContinuousIntegrationBuild=true
+        run: dotnet pack Npgsql.sln --configuration Release --property:PackageOutputPath="$PWD/nupkgs" -p:ContinuousIntegrationBuild=true      
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v3

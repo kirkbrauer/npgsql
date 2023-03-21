@@ -127,9 +127,9 @@ public sealed partial class NpgsqlWriteBuffer : IDisposable
         } else if (WritePosition == 0)
             return;
 
-        var finalCt = cancellationToken;
-        if (async && Timeout > TimeSpan.Zero)
-            finalCt = _timeoutCts.Start(cancellationToken);
+        var finalCt = async && Timeout > TimeSpan.Zero
+            ? _timeoutCts.Start(cancellationToken)
+            : cancellationToken;
 
         try
         {
@@ -137,7 +137,8 @@ public sealed partial class NpgsqlWriteBuffer : IDisposable
             {
                 await Underlying.WriteAsync(Buffer, 0, WritePosition, finalCt);
                 await Underlying.FlushAsync(finalCt);
-                _timeoutCts.Stop();
+                if (Timeout > TimeSpan.Zero) 
+                    _timeoutCts.Stop();
             }
             else
             {
@@ -335,9 +336,8 @@ public sealed partial class NpgsqlWriteBuffer : IDisposable
         WritePosition += Unsafe.SizeOf<T>();
     }
 
-    [MethodImpl(MethodImplOptions.NoInlining)]
     static void ThrowNotSpaceLeft()
-        => throw new InvalidOperationException("There is not enough space left in the buffer.");
+        => ThrowHelper.ThrowInvalidOperationException("There is not enough space left in the buffer.");
 
     public Task WriteString(string s, int byteLen, bool async, CancellationToken cancellationToken = default)
         => WriteString(s, s.Length, byteLen, async, cancellationToken);
@@ -424,6 +424,14 @@ public sealed partial class NpgsqlWriteBuffer : IDisposable
         WritePosition += TextEncoding.GetBytes(chars, offset, charCount, Buffer, WritePosition);
     }
 
+#if !NETSTANDARD2_0
+    internal void WriteChars(ReadOnlySpan<char> chars)
+    {
+        Debug.Assert(TextEncoding.GetByteCount(chars) <= WriteSpaceLeft);
+        WritePosition += TextEncoding.GetBytes(chars, Buffer.AsSpan(WritePosition));
+    }
+#endif
+
     public void WriteBytes(ReadOnlySpan<byte> buf)
     {
         Debug.Assert(buf.Length <= WriteSpaceLeft);
@@ -431,10 +439,15 @@ public sealed partial class NpgsqlWriteBuffer : IDisposable
         WritePosition += buf.Length;
     }
 
+    public void WriteBytes(ReadOnlyMemory<byte> buf)
+        => WriteBytes(buf.Span);
+
+    public void WriteBytes(byte[] buf) => WriteBytes(buf.AsSpan());
+
     public void WriteBytes(byte[] buf, int offset, int count)
         => WriteBytes(new ReadOnlySpan<byte>(buf, offset, count));
 
-    public Task WriteBytesRaw(byte[] bytes, bool async, CancellationToken cancellationToken = default)
+    public Task WriteBytesRaw(ReadOnlyMemory<byte> bytes, bool async, CancellationToken cancellationToken = default)
     {
         if (bytes.Length <= WriteSpaceLeft)
         {
@@ -443,7 +456,7 @@ public sealed partial class NpgsqlWriteBuffer : IDisposable
         }
         return WriteBytesLong(this, async, bytes, cancellationToken);
 
-        static async Task WriteBytesLong(NpgsqlWriteBuffer buffer, bool async, byte[] bytes, CancellationToken cancellationToken)
+        static async Task WriteBytesLong(NpgsqlWriteBuffer buffer, bool async, ReadOnlyMemory<byte> bytes, CancellationToken cancellationToken)
         {
             if (bytes.Length <= buffer.Size)
             {
@@ -461,12 +474,36 @@ public sealed partial class NpgsqlWriteBuffer : IDisposable
                         await buffer.Flush(async, cancellationToken);
                     var writeLen = Math.Min(remaining, buffer.WriteSpaceLeft);
                     var offset = bytes.Length - remaining;
-                    buffer.WriteBytes(bytes, offset, writeLen);
+                    buffer.WriteBytes(bytes.Slice(offset, writeLen));
                     remaining -= writeLen;
                 }
                 while (remaining > 0);
             }
         }
+    }
+
+    public async Task WriteStreamRaw(Stream stream, int count, bool async, CancellationToken cancellationToken = default)
+    {
+        while (count > 0)
+        {
+            if (WriteSpaceLeft == 0)
+                await Flush(async, cancellationToken);
+            try
+            {
+                var read = async
+                    ? await stream.ReadAsync(Buffer, WritePosition, Math.Min(WriteSpaceLeft, count), cancellationToken)
+                    : stream.Read(Buffer, WritePosition, Math.Min(WriteSpaceLeft, count));
+                if (read == 0)
+                    throw new EndOfStreamException();
+                WritePosition += read;
+                count -= read;
+            }
+            catch (Exception e)
+            {
+                throw Connector.Break(new NpgsqlException("Exception while writing to stream", e));
+            }
+        }
+        Debug.Assert(count == 0);
     }
 
     public void WriteNullTerminatedString(string s)

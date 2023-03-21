@@ -29,7 +29,6 @@ public class NetTopologySuiteTypeHandlerResolver : TypeHandlerResolver
 
         var (pgGeometryType, pgGeographyType) = (PgType("geometry"), PgType("geography"));
 
-        // TODO: In multiplexing, these are used concurrently... not sure they're thread-safe :(
         var reader = new PostGisReader(coordinateSequenceFactory, precisionModel, handleOrdinates);
         var writer = new PostGisWriter();
 
@@ -48,27 +47,9 @@ public class NetTopologySuiteTypeHandlerResolver : TypeHandlerResolver
         };
 
     public override NpgsqlTypeHandler? ResolveByClrType(Type type)
-        => ClrTypeToDataTypeName(type, _geographyAsDefault) is { } dataTypeName && ResolveByDataTypeName(dataTypeName) is { } handler
+        => NetTopologySuiteTypeMappingResolver.ClrTypeToDataTypeName(type, _geographyAsDefault) is { } dataTypeName && ResolveByDataTypeName(dataTypeName) is { } handler
             ? handler
             : null;
-
-    internal static string? ClrTypeToDataTypeName(Type type, bool geographyAsDefault)
-        => type != typeof(Geometry) && type.BaseType != typeof(Geometry) && type.BaseType != typeof(GeometryCollection)
-            ? null
-            : geographyAsDefault
-                ? "geography"
-                : "geometry";
-
-    public override TypeMappingInfo? GetMappingByDataTypeName(string dataTypeName)
-        => DoGetMappingByDataTypeName(dataTypeName);
-
-    internal static TypeMappingInfo? DoGetMappingByDataTypeName(string dataTypeName)
-        => dataTypeName switch
-        {
-            "geometry"  => new(NpgsqlDbType.Geometry,  "geometry"),
-            "geography" => new(NpgsqlDbType.Geography, "geography"),
-            _ => null
-        };
 
     PostgresType? PgType(string pgTypeName) => _databaseInfo.TryGetPostgresTypeByName(pgTypeName, out var pgType) ? pgType : null;
 }

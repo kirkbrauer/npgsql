@@ -9,9 +9,7 @@ public class ListLoggerProvider : ILoggerProvider
     readonly ListLogger _logger;
     bool _recording;
 
-    public static ListLoggerProvider Instance = new();
-
-    ListLoggerProvider()
+    public ListLoggerProvider()
         => _logger = new ListLogger(this);
 
     public List<(LogLevel Level, EventId Id, string Message, object? State, Exception? Exception)> Log
@@ -70,7 +68,7 @@ public class ListLoggerProvider : ILoggerProvider
 
         public bool IsEnabled(LogLevel logLevel) => _provider._recording;
 
-        public IDisposable BeginScope<TState>(TState state)
+        public IDisposable BeginScope<TState>(TState state) where TState : notnull
             => new Scope();
 
         class Scope : IDisposable

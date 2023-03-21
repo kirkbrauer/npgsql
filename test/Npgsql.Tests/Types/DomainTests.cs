@@ -13,14 +13,9 @@ public class DomainTests : MultiplexingTestBase
         if (IsMultiplexing)
             Assert.Ignore("Multiplexing, ReloadTypes");
 
-        var csb = new NpgsqlConnectionStringBuilder(ConnectionString)
-        {
-            ApplicationName = nameof(Domain_resolution),  // Prevent backend type caching in TypeHandlerRegistry
-            Pooling = false
-        };
-
-        using var conn = await OpenConnectionAsync(csb);
-        await using var _ = await GetTempTypeName(conn, out var type);
+        await using var dataSource = CreateDataSource(csb => csb.Pooling = false);
+        await using var conn = await dataSource.OpenConnectionAsync();
+        var type = await GetTempTypeName(conn);
         await conn.ExecuteNonQueryAsync($"CREATE DOMAIN {type} AS text");
 
         // Resolve type by DataTypeName
@@ -51,7 +46,7 @@ public class DomainTests : MultiplexingTestBase
     public async Task Domain()
     {
         using var conn = await OpenConnectionAsync();
-        await using var _ = await GetTempTypeName(conn, out var type);
+        var type = await GetTempTypeName(conn);
         await conn.ExecuteNonQueryAsync($"CREATE DOMAIN {type} AS text");
         Assert.That(await conn.ExecuteScalarAsync($"SELECT 'foo'::{type}"), Is.EqualTo("foo"));
     }
@@ -59,20 +54,19 @@ public class DomainTests : MultiplexingTestBase
     [Test]
     public async Task Domain_in_composite()
     {
-        if (IsMultiplexing)
-            Assert.Ignore("Multiplexing, ReloadTypes");
-
-        using var conn = await OpenConnectionAsync();
-        await using var t1 = await GetTempTypeName(conn, out var domainType);
-        await using var t2 = await GetTempTypeName(conn, out var compositeType);
-        await conn.ExecuteNonQueryAsync($@"
+        await using var adminConnection = await OpenConnectionAsync();
+        var domainType = await GetTempTypeName(adminConnection);
+        var compositeType = await GetTempTypeName(adminConnection);
+        await adminConnection.ExecuteNonQueryAsync($@"
 CREATE DOMAIN {domainType} AS text;
 CREATE TYPE {compositeType} AS (value {domainType});");
 
-        conn.ReloadTypes();
-        conn.TypeMapper.MapComposite<SomeComposite>(compositeType);
+        var dataSourceBuilder = CreateDataSourceBuilder();
+        dataSourceBuilder.MapComposite<SomeComposite>(compositeType);
+        await using var dataSource = dataSourceBuilder.Build();
+        await using var connection = await dataSource.OpenConnectionAsync();
 
-        var result = (SomeComposite)(await conn.ExecuteScalarAsync($"SELECT ROW('foo')::{compositeType}"))!;
+        var result = (SomeComposite)(await connection.ExecuteScalarAsync($"SELECT ROW('foo')::{compositeType}"))!;
         Assert.That(result.Value, Is.EqualTo("foo"));
     }
 

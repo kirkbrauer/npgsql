@@ -1,13 +1,10 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
-using System.Collections.Immutable;
 using System.Collections.Specialized;
-using System.Data;
+using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Numerics;
-using System.Text.Json;
 using Npgsql.Internal;
 using Npgsql.Internal.TypeHandlers;
 using Npgsql.Internal.TypeHandlers.DateTimeHandlers;
@@ -24,145 +21,10 @@ using static Npgsql.Util.Statics;
 
 namespace Npgsql.TypeMapping;
 
-class BuiltInTypeHandlerResolver : TypeHandlerResolver
+sealed class BuiltInTypeHandlerResolver : TypeHandlerResolver
 {
     readonly NpgsqlConnector _connector;
     readonly NpgsqlDatabaseInfo _databaseInfo;
-
-    static readonly Type ReadOnlyIPAddressType = IPAddress.Loopback.GetType();
-
-    static readonly Dictionary<string, TypeMappingInfo> Mappings = new()
-    {
-        // Numeric types
-        { "smallint",         new(NpgsqlDbType.Smallint, "smallint",         typeof(short), typeof(byte), typeof(sbyte)) },
-        { "integer",          new(NpgsqlDbType.Integer,  "integer",          typeof(int)) },
-        { "int",              new(NpgsqlDbType.Integer,  "integer",          typeof(int)) },
-        { "bigint",           new(NpgsqlDbType.Bigint,   "bigint",           typeof(long)) },
-        { "real",             new(NpgsqlDbType.Real,     "real",             typeof(float)) },
-        { "double precision", new(NpgsqlDbType.Double,   "double precision", typeof(double)) },
-        { "numeric",          new(NpgsqlDbType.Numeric,  "numeric",          typeof(decimal), typeof(BigInteger)) },
-        { "decimal",          new(NpgsqlDbType.Numeric,  "numeric",          typeof(decimal), typeof(BigInteger)) },
-        { "money",            new(NpgsqlDbType.Money,    "money") },
-
-        // Text types
-        { "text",              new(NpgsqlDbType.Text,      "text", typeof(string), typeof(char[]), typeof(char), typeof(ArraySegment<char>)) },
-        { "xml",               new(NpgsqlDbType.Xml,       "xml") },
-        { "character varying", new(NpgsqlDbType.Varchar,   "character varying") },
-        { "varchar",           new(NpgsqlDbType.Varchar,   "character varying") },
-        { "character",         new(NpgsqlDbType.Char,      "character") },
-        { "name",              new(NpgsqlDbType.Name,      "name") },
-        { "refcursor",         new(NpgsqlDbType.Refcursor, "refcursor") },
-        { "citext",            new(NpgsqlDbType.Citext,    "citext") },
-        { "jsonb",             new(NpgsqlDbType.Jsonb,     "jsonb", typeof(JsonDocument)) },
-        { "json",              new(NpgsqlDbType.Json,      "json") },
-        { "jsonpath",          new(NpgsqlDbType.JsonPath,  "jsonpath") },
-
-        // Date/time types
-        { "timestamp without time zone", new(NpgsqlDbType.Timestamp,   "timestamp without time zone", typeof(DateTime)) },
-        { "timestamp",                   new(NpgsqlDbType.Timestamp,   "timestamp without time zone", typeof(DateTime)) },
-        { "timestamp with time zone",    new(NpgsqlDbType.TimestampTz, "timestamp with time zone",    typeof(DateTimeOffset)) },
-        { "timestamptz",                 new(NpgsqlDbType.TimestampTz, "timestamp with time zone",    typeof(DateTimeOffset)) },
-        { "date",                        new(NpgsqlDbType.Date,        "date"
-#if NET6_0_OR_GREATER
-            , typeof(DateOnly)
-#endif
-        ) },
-        { "time without time zone",      new(NpgsqlDbType.Time,        "time without time zone"
-#if NET6_0_OR_GREATER
-            , typeof(TimeOnly)
-#endif
-        ) },
-        { "time",                        new(NpgsqlDbType.Time,        "time without time zone"
-#if NET6_0_OR_GREATER
-            , typeof(TimeOnly)
-#endif
-        ) },
-        { "time with time zone",         new(NpgsqlDbType.TimeTz,      "time with time zone") },
-        { "timetz",                      new(NpgsqlDbType.TimeTz,      "time with time zone") },
-        { "interval",                    new(NpgsqlDbType.Interval,    "interval", typeof(TimeSpan)) },
-
-        { "timestamp without time zone[]", new(NpgsqlDbType.Array | NpgsqlDbType.Timestamp,   "timestamp without time zone[]") },
-        { "timestamp with time zone[]",    new(NpgsqlDbType.Array | NpgsqlDbType.TimestampTz, "timestamp with time zone[]") },
-
-        { "int4range",                     new(NpgsqlDbType.IntegerRange,     "int4range") },
-        { "int8range",                     new(NpgsqlDbType.BigIntRange,      "int8range") },
-        { "numrange",                      new(NpgsqlDbType.NumericRange,     "numrange") },
-        { "daterange",                     new(NpgsqlDbType.DateRange,        "daterange") },
-        { "tsrange",                       new(NpgsqlDbType.TimestampRange,   "tsrange") },
-        { "tstzrange",                     new(NpgsqlDbType.TimestampTzRange, "tstzrange") },
-
-        { "int4multirange",                new(NpgsqlDbType.IntegerMultirange,     "int4range") },
-        { "int8multirange",                new(NpgsqlDbType.BigIntMultirange,      "int8range") },
-        { "nummultirange",                 new(NpgsqlDbType.NumericMultirange,     "numrange") },
-        { "datemultirange",                new(NpgsqlDbType.DateMultirange,        "datemultirange") },
-        { "tsmultirange",                  new(NpgsqlDbType.TimestampMultirange,   "tsmultirange") },
-        { "tstzmultirange",                new(NpgsqlDbType.TimestampTzMultirange, "tstzmultirange") },
-
-        // Network types
-        { "cidr",      new(NpgsqlDbType.Cidr,     "cidr") },
-#pragma warning disable 618
-        { "inet",      new(NpgsqlDbType.Inet,     "inet", typeof(IPAddress), typeof((IPAddress Address, int Subnet)), typeof(NpgsqlInet), ReadOnlyIPAddressType) },
-#pragma warning restore 618
-        { "macaddr",   new(NpgsqlDbType.MacAddr,  "macaddr", typeof(PhysicalAddress)) },
-        { "macaddr8",  new(NpgsqlDbType.MacAddr8, "macaddr8") },
-
-        // Full-text search types
-        { "tsquery",   new(NpgsqlDbType.TsQuery,  "tsquery",
-            typeof(NpgsqlTsQuery), typeof(NpgsqlTsQueryAnd), typeof(NpgsqlTsQueryEmpty), typeof(NpgsqlTsQueryFollowedBy),
-            typeof(NpgsqlTsQueryLexeme), typeof(NpgsqlTsQueryNot), typeof(NpgsqlTsQueryOr), typeof(NpgsqlTsQueryBinOp)
-        ) },
-        { "tsvector",  new(NpgsqlDbType.TsVector, "tsvector", typeof(NpgsqlTsVector)) },
-
-        // Geometry types
-        { "box",      new(NpgsqlDbType.Box,     "box",     typeof(NpgsqlBox)) },
-        { "circle",   new(NpgsqlDbType.Circle,  "circle",  typeof(NpgsqlCircle)) },
-        { "line",     new(NpgsqlDbType.Line,    "line",    typeof(NpgsqlLine)) },
-        { "lseg",     new(NpgsqlDbType.LSeg,    "lseg",    typeof(NpgsqlLSeg)) },
-        { "path",     new(NpgsqlDbType.Path,    "path",    typeof(NpgsqlPath)) },
-        { "point",    new(NpgsqlDbType.Point,   "point",   typeof(NpgsqlPoint)) },
-        { "polygon",  new(NpgsqlDbType.Polygon, "polygon", typeof(NpgsqlPolygon)) },
-
-        // LTree types
-        { "lquery",     new(NpgsqlDbType.LQuery,    "lquery") },
-        { "ltree",      new(NpgsqlDbType.LTree,     "ltree") },
-        { "ltxtquery",  new(NpgsqlDbType.LTxtQuery, "ltxtquery") },
-
-        // UInt types
-        { "oid",        new(NpgsqlDbType.Oid,       "oid") },
-        { "xid",        new(NpgsqlDbType.Xid,       "xid") },
-        { "xid8",       new(NpgsqlDbType.Xid8,      "xid8") },
-        { "cid",        new(NpgsqlDbType.Cid,       "cid") },
-        { "regtype",    new(NpgsqlDbType.Regtype,   "regtype") },
-        { "regconfig",  new(NpgsqlDbType.Regconfig, "regconfig") },
-
-        // Misc types
-        { "boolean",     new(NpgsqlDbType.Boolean, "boolean", typeof(bool)) },
-        { "bool",        new(NpgsqlDbType.Boolean, "boolean", typeof(bool)) },
-        { "bytea",       new(NpgsqlDbType.Bytea,   "bytea", typeof(byte[]), typeof(ArraySegment<byte>)
-#if !NETSTANDARD2_0
-            , typeof(ReadOnlyMemory<byte>), typeof(Memory<byte>)
-#endif
-        ) },
-        { "uuid",        new(NpgsqlDbType.Uuid,    "uuid", typeof(Guid)) },
-        { "bit varying", new(NpgsqlDbType.Varbit,  "bit varying", typeof(BitArray), typeof(BitVector32)) },
-        { "varbit",      new(NpgsqlDbType.Varbit,  "bit varying", typeof(BitArray), typeof(BitVector32)) },
-        { "bit",         new(NpgsqlDbType.Bit,     "bit") },
-        { "hstore",      new(NpgsqlDbType.Hstore,  "hstore", typeof(Dictionary<string, string?>), typeof(IDictionary<string, string?>)
-#if !NETSTANDARD2_0 && !NETSTANDARD2_1
-            , typeof(ImmutableDictionary<string, string?>)
-#endif
-        ) },
-
-        // Internal types
-        { "int2vector",  new(NpgsqlDbType.Int2Vector,   "int2vector") },
-        { "oidvector",   new(NpgsqlDbType.Oidvector,    "oidvector") },
-        { "pg_lsn",      new(NpgsqlDbType.PgLsn,        "pg_lsn", typeof(NpgsqlLogSequenceNumber)) },
-        { "tid",         new(NpgsqlDbType.Tid,          "tid", typeof(NpgsqlTid)) },
-        { "char",        new(NpgsqlDbType.InternalChar, "char") },
-
-        // Special types
-        { "unknown",  new(NpgsqlDbType.Unknown, "unknown") },
-    };
 
     #region Cached handlers
 
@@ -183,8 +45,8 @@ class BuiltInTypeHandlerResolver : TypeHandlerResolver
     TextHandler? _nameHandler;
     TextHandler? _refcursorHandler;
     TextHandler? _citextHandler;
-    JsonHandler? _jsonbHandler; // Note that old version of PG (and Redshift) don't have jsonb
-    JsonHandler? _jsonHandler;
+    JsonTextHandler? _jsonbHandler; // Note that old version of PG (and Redshift) don't have jsonb
+    JsonTextHandler? _jsonHandler;
     JsonPathHandler? _jsonPathHandler;
 
     // Date/time types
@@ -233,7 +95,6 @@ class BuiltInTypeHandlerResolver : TypeHandlerResolver
     UuidHandler? _uuidHandler;
     BitStringHandler? _bitVaryingHandler;
     BitStringHandler? _bitHandler;
-    RecordHandler? _recordHandler;
     VoidHandler? _voidHandler;
     HstoreHandler? _hstoreHandler;
 
@@ -250,10 +111,6 @@ class BuiltInTypeHandlerResolver : TypeHandlerResolver
     // Complex type handlers over timestamp/timestamptz (because DateTime is value-dependent)
     NpgsqlTypeHandler? _timestampArrayHandler;
     NpgsqlTypeHandler? _timestampTzArrayHandler;
-    NpgsqlTypeHandler? _timestampRangeHandler;
-    NpgsqlTypeHandler? _timestampTzRangeHandler;
-    NpgsqlTypeHandler? _timestampMultirangeHandler;
-    NpgsqlTypeHandler? _timestampTzMultirangeHandler;
 
     #endregion Cached handlers
 
@@ -353,7 +210,7 @@ class BuiltInTypeHandlerResolver : TypeHandlerResolver
             "pg_lsn"     => PgLsnHandler(),
             "tid"        => TidHandler(),
             "char"       => InternalCharHandler(),
-            "record"     => RecordHandler(),
+            "record"     => new UnsupportedHandler(PgType("record"), $"Records aren't supported; please call {nameof(NpgsqlSlimDataSourceBuilder.EnableRecords)} on {nameof(NpgsqlSlimDataSourceBuilder)} to enable records."),
             "void"       => VoidHandler(),
 
             "unknown"    => UnknownHandler(),
@@ -362,121 +219,16 @@ class BuiltInTypeHandlerResolver : TypeHandlerResolver
         };
 
     public override NpgsqlTypeHandler? ResolveByClrType(Type type)
-        => ClrTypeToDataTypeNameTable.TryGetValue(type, out var dataTypeName) && ResolveByDataTypeName(dataTypeName) is { } handler
-            ? handler
-            : null;
-
-    static readonly Dictionary<Type, string> ClrTypeToDataTypeNameTable;
-
-    static BuiltInTypeHandlerResolver()
     {
-        ClrTypeToDataTypeNameTable = new()
+        if (BuiltInTypeMappingResolver.ClrTypeToDataTypeName(type) is not { } dataTypeName)
         {
-            // Numeric types
-            { typeof(byte),       "smallint" },
-            { typeof(short),      "smallint" },
-            { typeof(int),        "integer" },
-            { typeof(long),       "bigint" },
-            { typeof(float),      "real" },
-            { typeof(double),     "double precision" },
-            { typeof(decimal),    "decimal" },
-            { typeof(BigInteger), "decimal" },
+            if (!type.IsSubclassOf(typeof(Stream)))
+                return null;
 
-            // Text types
-            { typeof(string),             "text" },
-            { typeof(char[]),             "text" },
-            { typeof(char),               "text" },
-            { typeof(ArraySegment<char>), "text" },
-            { typeof(JsonDocument),       "jsonb" },
+            dataTypeName = "bytea";
+        }
 
-            // Date/time types
-            // The DateTime entry is for LegacyTimestampBehavior mode only. In regular mode we resolve through
-            // ResolveValueDependentValue below
-            { typeof(DateTime),       "timestamp without time zone" },
-            { typeof(DateTimeOffset), "timestamp with time zone" },
-#if NET6_0_OR_GREATER
-            { typeof(DateOnly),       "date" },
-            { typeof(TimeOnly),       "time without time zone" },
-#endif
-            { typeof(TimeSpan),       "interval" },
-            { typeof(NpgsqlInterval), "interval" },
-
-            // Network types
-            { typeof(IPAddress),                       "inet" },
-            // See ReadOnlyIPAddress below
-            { typeof((IPAddress Address, int Subnet)), "inet" },
-#pragma warning disable 618
-            { typeof(NpgsqlInet),                      "inet" },
-#pragma warning restore 618
-            { typeof(PhysicalAddress),                 "macaddr" },
-
-            // Full-text types
-            { typeof(NpgsqlTsVector),          "tsvector" },
-            { typeof(NpgsqlTsQueryLexeme),     "tsquery" },
-            { typeof(NpgsqlTsQueryAnd),        "tsquery" },
-            { typeof(NpgsqlTsQueryOr),         "tsquery" },
-            { typeof(NpgsqlTsQueryNot),        "tsquery" },
-            { typeof(NpgsqlTsQueryEmpty),      "tsquery" },
-            { typeof(NpgsqlTsQueryFollowedBy), "tsquery" },
-
-            // Geometry types
-            { typeof(NpgsqlBox),     "box" },
-            { typeof(NpgsqlCircle),  "circle" },
-            { typeof(NpgsqlLine),    "line" },
-            { typeof(NpgsqlLSeg),    "lseg" },
-            { typeof(NpgsqlPath),    "path" },
-            { typeof(NpgsqlPoint),   "point" },
-            { typeof(NpgsqlPolygon), "polygon" },
-
-            // Misc types
-            { typeof(bool),                 "boolean" },
-            { typeof(byte[]),               "bytea" },
-            { typeof(ArraySegment<byte>),   "bytea" },
-#if !NETSTANDARD2_0
-            { typeof(ReadOnlyMemory<byte>), "bytea" },
-            { typeof(Memory<byte>),         "bytea" },
-#endif
-            { typeof(Guid),                                "uuid" },
-            { typeof(BitArray),                            "bit varying" },
-            { typeof(BitVector32),                         "bit varying" },
-            { typeof(Dictionary<string, string>),          "hstore" },
-#if !NETSTANDARD2_0 && !NETSTANDARD2_1
-            { typeof(ImmutableDictionary<string, string>), "hstore" },
-#endif
-
-            // Internal types
-            { typeof(NpgsqlLogSequenceNumber), "pg_lsn" },
-            { typeof(NpgsqlTid),               "tid" },
-            { typeof(DBNull),                  "unknown" },
-
-            // Built-in range types
-            { typeof(NpgsqlRange<int>), "int4range" },
-            { typeof(NpgsqlRange<long>), "int8range" },
-            { typeof(NpgsqlRange<decimal>), "numrange" },
-#if NET6_0_OR_GREATER
-            { typeof(NpgsqlRange<DateOnly>), "daterange" },
-#endif
-
-            // Built-in multirange types
-            { typeof(NpgsqlRange<int>[]), "int4multirange" },
-            { typeof(List<NpgsqlRange<int>>), "int4multirange" },
-            { typeof(NpgsqlRange<long>[]), "int8multirange" },
-            { typeof(List<NpgsqlRange<long>>), "int8multirange" },
-            { typeof(NpgsqlRange<decimal>[]), "nummultirange" },
-            { typeof(List<NpgsqlRange<decimal>>), "nummultirange" },
-#if NET6_0_OR_GREATER
-            { typeof(NpgsqlRange<DateOnly>[]), "datemultirange" },
-            { typeof(List<NpgsqlRange<DateOnly>>), "datemultirange" },
-#endif
-        };
-
-        // Recent versions of .NET Core have an internal ReadOnlyIPAddress type (returned e.g. for IPAddress.Loopback)
-        // But older versions don't have it
-        if (ReadOnlyIPAddressType != typeof(IPAddress))
-            ClrTypeToDataTypeNameTable[ReadOnlyIPAddressType] = "inet";
-
-        if (LegacyTimestampBehavior)
-            ClrTypeToDataTypeNameTable[typeof(DateTime)] = "timestamp without time zone";
+        return ResolveByDataTypeName(dataTypeName);
     }
 
     public override NpgsqlTypeHandler? ResolveValueDependentValue(object value)
@@ -493,12 +245,6 @@ class BuiltInTypeHandlerResolver : TypeHandlerResolver
             // mix incompatible Kinds, that will fail during validation. For empty arrays it doesn't matter.
             IList<DateTime> array => ArrayHandler(array.Count == 0 ? DateTimeKind.Unspecified : array[0].Kind),
 
-            NpgsqlRange<DateTime> range => RangeHandler(!range.LowerBoundInfinite ? range.LowerBound.Kind :
-                !range.UpperBoundInfinite ? range.UpperBound.Kind : DateTimeKind.Unspecified),
-
-            NpgsqlRange<DateTime>[] multirange => MultirangeHandler(GetMultirangeKind(multirange)),
-            List<NpgsqlRange<DateTime>> multirange => MultirangeHandler(GetMultirangeKind(multirange)),
-
             _ => null
         };
 
@@ -508,56 +254,6 @@ class BuiltInTypeHandlerResolver : TypeHandlerResolver
                     (PostgresArrayType)PgType("timestamp with time zone[]"), _connector.Settings.ArrayNullabilityMode)
                 : _timestampArrayHandler ??= _timestampHandler.CreateArrayHandler(
                     (PostgresArrayType)PgType("timestamp without time zone[]"), _connector.Settings.ArrayNullabilityMode);
-
-        NpgsqlTypeHandler RangeHandler(DateTimeKind kind)
-            => kind == DateTimeKind.Utc
-                ? _timestampTzRangeHandler ??= _timestampTzHandler.CreateRangeHandler((PostgresRangeType)PgType("tstzrange"))
-                : _timestampRangeHandler ??= _timestampHandler.CreateRangeHandler((PostgresRangeType)PgType("tsrange"));
-
-        NpgsqlTypeHandler MultirangeHandler(DateTimeKind kind)
-            => kind == DateTimeKind.Utc
-                ? _timestampTzMultirangeHandler ??= _timestampTzHandler.CreateMultirangeHandler((PostgresMultirangeType)PgType("tstzmultirange"))
-                : _timestampMultirangeHandler ??= _timestampHandler.CreateMultirangeHandler((PostgresMultirangeType)PgType("tsmultirange"));
-    }
-
-    static DateTimeKind GetRangeKind(NpgsqlRange<DateTime> range)
-        => !range.LowerBoundInfinite
-            ? range.LowerBound.Kind
-            : !range.UpperBoundInfinite
-                ? range.UpperBound.Kind
-                : DateTimeKind.Unspecified;
-
-    static DateTimeKind GetMultirangeKind(IList<NpgsqlRange<DateTime>> multirange)
-    {
-        for (var i = 0; i < multirange.Count; i++)
-            if (!multirange[i].IsEmpty)
-                return GetRangeKind(multirange[i]);
-
-        return DateTimeKind.Unspecified;
-    }
-
-    internal static string? ValueDependentValueToDataTypeName(object value)
-    {
-        // In LegacyTimestampBehavior, DateTime isn't value-dependent, and handled above in ClrTypeToDataTypeNameTable like other types
-        if (LegacyTimestampBehavior)
-            return null;
-
-        return value switch
-        {
-            DateTime dateTime => dateTime.Kind == DateTimeKind.Utc ? "timestamp with time zone" : "timestamp without time zone",
-
-            // For arrays/lists, return timestamp or timestamptz based on the kind of the first DateTime; if the user attempts to
-            // mix incompatible Kinds, that will fail during validation. For empty arrays it doesn't matter.
-            IList<DateTime> array => array.Count == 0
-                ? "timestamp without time zone[]"
-                : array[0].Kind == DateTimeKind.Utc ? "timestamp with time zone[]" : "timestamp without time zone[]",
-
-            NpgsqlRange<DateTime> range => GetRangeKind(range) == DateTimeKind.Utc ? "tstzrange" : "tsrange",
-
-            NpgsqlRange<DateTime>[] multirange => GetMultirangeKind(multirange) == DateTimeKind.Utc ? "tstzmultirange" : "tsmultirange",
-
-            _ => null
-        };
     }
 
     public override NpgsqlTypeHandler? ResolveValueTypeGenerically<T>(T value)
@@ -588,8 +284,6 @@ class BuiltInTypeHandlerResolver : TypeHandlerResolver
             return _textHandler;
         if (typeof(T) == typeof(ArraySegment<char>))
             return _textHandler;
-        if (typeof(T) == typeof(JsonDocument))
-            return JsonbHandler();
 
         // Date/time types
         // No resolution for DateTime, since that's value-dependent (Kind)
@@ -649,15 +343,6 @@ class BuiltInTypeHandlerResolver : TypeHandlerResolver
         return null;
     }
 
-    internal static string? ClrTypeToDataTypeName(Type type)
-        => ClrTypeToDataTypeNameTable.TryGetValue(type, out var dataTypeName) ? dataTypeName : null;
-
-    public override TypeMappingInfo? GetMappingByDataTypeName(string dataTypeName)
-        => DoGetMappingByDataTypeName(dataTypeName);
-
-    internal static TypeMappingInfo? DoGetMappingByDataTypeName(string dataTypeName)
-        => Mappings.TryGetValue(dataTypeName, out var mapping) ? mapping : null;
-
     PostgresType PgType(string pgTypeName) => _databaseInfo.GetPostgresTypeByName(pgTypeName);
 
     #region Handler accessors
@@ -675,8 +360,8 @@ class BuiltInTypeHandlerResolver : TypeHandlerResolver
     NpgsqlTypeHandler? CitextHandler()   => _citextHandler ??= _databaseInfo.TryGetPostgresTypeByName("citext", out var pgType)
         ? new TextHandler(pgType, _connector.TextEncoding)
         : null;
-    NpgsqlTypeHandler JsonbHandler()     => _jsonbHandler ??= new JsonHandler(PgType("jsonb"), _connector.TextEncoding, isJsonb: true);
-    NpgsqlTypeHandler JsonHandler()      => _jsonHandler ??= new JsonHandler(PgType("json"), _connector.TextEncoding, isJsonb: false);
+    NpgsqlTypeHandler JsonbHandler()     => _jsonbHandler ??= new JsonTextHandler(PgType("jsonb"), _connector.TextEncoding, isJsonb: true);
+    NpgsqlTypeHandler JsonHandler()      => _jsonHandler ??= new JsonTextHandler(PgType("json"), _connector.TextEncoding, isJsonb: false);
     NpgsqlTypeHandler JsonPathHandler()  => _jsonPathHandler ??= new JsonPathHandler(PgType("jsonpath"), _connector.TextEncoding);
 
     // Date/time types
@@ -737,10 +422,9 @@ class BuiltInTypeHandlerResolver : TypeHandlerResolver
     NpgsqlTypeHandler PgLsnHandler()        => _pgLsnHandler ??= new PgLsnHandler(PgType("pg_lsn"));
     NpgsqlTypeHandler TidHandler()          => _tidHandler ??= new TidHandler(PgType("tid"));
     NpgsqlTypeHandler InternalCharHandler() => _internalCharHandler ??= new InternalCharHandler(PgType("char"));
-    NpgsqlTypeHandler RecordHandler()       => _recordHandler ??= new RecordHandler(PgType("record"), _connector.TypeMapper);
     NpgsqlTypeHandler VoidHandler()         => _voidHandler ??= new VoidHandler(PgType("void"));
 
-    NpgsqlTypeHandler UnknownHandler() => _unknownHandler ??= new UnknownTypeHandler(_connector);
+    NpgsqlTypeHandler UnknownHandler() => _unknownHandler ??= new UnknownTypeHandler(_connector.TextEncoding);
 
     #endregion Handler accessors
 }

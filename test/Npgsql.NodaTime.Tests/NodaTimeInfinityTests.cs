@@ -9,13 +9,26 @@ using static Npgsql.NodaTime.Internal.NodaTimeUtils;
 
 namespace Npgsql.NodaTime.Tests;
 
-[TestFixture(true)]
-#if DEBUG
 [TestFixture(false)]
-#endif
+#if DEBUG
+[TestFixture(true)]
 [NonParallelizable]
+#endif
 public class NodaTimeInfinityTests : TestBase
 {
+    [Test] // #4715
+    public async Task DateRange_with_upper_bound_infinity()
+    {
+        if (DisableDateTimeInfinityConversions)
+            return;
+
+        await AssertType(
+            new DateInterval(LocalDate.MinIsoValue, LocalDate.MaxIsoValue),
+            "[-infinity,infinity]",
+            "daterange",
+            NpgsqlDbType.DateRange);
+    }
+
     [Test]
     public async Task Timestamptz_read_values()
     {
@@ -253,15 +266,14 @@ public class NodaTimeInfinityTests : TestBase
         }
     }
 
-    protected override async ValueTask<NpgsqlConnection> OpenConnectionAsync(string? connectionString = null)
+    protected override async ValueTask<NpgsqlConnection> OpenConnectionAsync()
     {
-        var conn = await base.OpenConnectionAsync(connectionString);
-        conn.TypeMapper.UseNodaTime();
+        var conn = await base.OpenConnectionAsync();
         await conn.ExecuteNonQueryAsync("SET TimeZone='Europe/Berlin'");
         return conn;
     }
 
-    protected override NpgsqlConnection OpenConnection(string? connectionString = null)
+    protected override NpgsqlConnection OpenConnection()
         => throw new NotSupportedException();
 
     public NodaTimeInfinityTests(bool disableDateTimeInfinityConversions)
@@ -270,11 +282,11 @@ public class NodaTimeInfinityTests : TestBase
         DisableDateTimeInfinityConversions = disableDateTimeInfinityConversions;
         Statics.DisableDateTimeInfinityConversions = disableDateTimeInfinityConversions;
 #else
-            if (disableDateTimeInfinityConversions)
-            {
-                Assert.Ignore(
-                    "NodaTimeInfinityTests rely on the Npgsql.DisableDateTimeInfinityConversions AppContext switch and can only be run in DEBUG builds");
-            }
+        if (disableDateTimeInfinityConversions)
+        {
+            Assert.Ignore(
+                "NodaTimeInfinityTests rely on the Npgsql.DisableDateTimeInfinityConversions AppContext switch and can only be run in DEBUG builds");
+        }
 #endif
     }
 

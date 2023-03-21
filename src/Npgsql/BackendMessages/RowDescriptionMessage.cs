@@ -6,6 +6,7 @@ using System.Globalization;
 using Npgsql.Internal;
 using Npgsql.Internal.TypeHandlers;
 using Npgsql.Internal.TypeHandling;
+using Npgsql.Internal.TypeMapping;
 using Npgsql.PostgresTypes;
 using Npgsql.Replication.PgOutput.Messages;
 using Npgsql.TypeMapping;
@@ -42,7 +43,7 @@ sealed class RowDescriptionMessage : IBackendMessage, IReadOnlyList<FieldDescrip
             _insensitiveIndex = new Dictionary<string, int>(source._insensitiveIndex);
     }
 
-    internal RowDescriptionMessage Load(NpgsqlReadBuffer buf, ConnectorTypeMapper typeMapper)
+    internal RowDescriptionMessage Load(NpgsqlReadBuffer buf, TypeMapper typeMapper)
     {
         _nameIndex.Clear();
         _insensitiveIndex?.Clear();
@@ -70,15 +71,14 @@ sealed class RowDescriptionMessage : IBackendMessage, IReadOnlyList<FieldDescrip
                 formatCode:            (FormatCode)buf.ReadInt16()
             );
 
-            if (!_nameIndex.ContainsKey(field.Name))
-                _nameIndex.Add(field.Name, i);
+            _nameIndex.TryAdd(field.Name, i);
         }
 
         return this;
     }
 
     internal static RowDescriptionMessage CreateForReplication(
-        ConnectorTypeMapper typeMapper, uint tableOID, FormatCode formatCode, IReadOnlyList<RelationMessage.Column> columns)
+        TypeMapper typeMapper, uint tableOID, FormatCode formatCode, IReadOnlyList<RelationMessage.Column> columns)
     {
         var msg = new RowDescriptionMessage(columns.Count);
         var numFields = msg.Count = columns.Count;
@@ -126,9 +126,11 @@ sealed class RowDescriptionMessage : IBackendMessage, IReadOnlyList<FieldDescrip
     /// Given a string name, returns the field's ordinal index in the row.
     /// </summary>
     internal int GetFieldIndex(string name)
-        => TryGetFieldIndex(name, out var ret)
-            ? ret
-            : throw new IndexOutOfRangeException("Field not found in row: " + name);
+    {
+        if (!TryGetFieldIndex(name, out var ret))
+            ThrowHelper.ThrowIndexOutOfRangeException($"Field not found in row: {name}");
+        return ret;
+    }
 
     /// <summary>
     /// Given a string name, returns the field's ordinal index in the row.
@@ -144,8 +146,7 @@ sealed class RowDescriptionMessage : IBackendMessage, IReadOnlyList<FieldDescrip
                 _insensitiveIndex = new Dictionary<string, int>(InsensitiveComparer.Instance);
 
             foreach (var kv in _nameIndex)
-                if (!_insensitiveIndex.ContainsKey(kv.Key))
-                    _insensitiveIndex[kv.Key] = kv.Value;
+                _insensitiveIndex.TryAdd(kv.Key, kv.Value);
         }
 
         return _insensitiveIndex.TryGetValue(name, out fieldIndex);
@@ -174,7 +175,7 @@ sealed class RowDescriptionMessage : IBackendMessage, IReadOnlyList<FieldDescrip
             => CompareInfo.GetSortKey(o, CompareOptions.IgnoreWidth | CompareOptions.IgnoreCase | CompareOptions.IgnoreKanaType).GetHashCode();
     }
 
-    class Enumerator : IEnumerator<FieldDescription>
+    sealed class Enumerator : IEnumerator<FieldDescription>
     {
         readonly RowDescriptionMessage _rowDescription;
         int _pos = -1;
@@ -183,7 +184,14 @@ sealed class RowDescriptionMessage : IBackendMessage, IReadOnlyList<FieldDescrip
             => _rowDescription = rowDescription;
 
         public FieldDescription Current
-            => _pos >= 0 ? _rowDescription[_pos] : throw new InvalidOperationException();
+        {
+            get
+            {
+                if (_pos < 0)
+                    ThrowHelper.ThrowInvalidOperationException();
+                return _rowDescription[_pos];
+            }
+        }
 
         object IEnumerator.Current => Current;
 
@@ -240,7 +248,7 @@ public sealed class FieldDescription
     }
 
     internal void Populate(
-        ConnectorTypeMapper typeMapper, string name, uint tableOID, short columnAttributeNumber,
+        TypeMapper typeMapper, string name, uint tableOID, short columnAttributeNumber,
         uint oid, short typeSize, int typeModifier, FormatCode formatCode
     )
     {
@@ -311,7 +319,7 @@ public sealed class FieldDescription
     internal void ResolveHandler()
         => Handler = IsBinaryFormat ? _typeMapper.ResolveByOID(TypeOID) : _typeMapper.UnrecognizedTypeHandler;
 
-    ConnectorTypeMapper _typeMapper;
+    TypeMapper _typeMapper;
 
     internal bool IsBinaryFormat => FormatCode == FormatCode.Binary;
     internal bool IsTextFormat => FormatCode == FormatCode.Text;

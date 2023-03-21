@@ -1,6 +1,7 @@
 using Npgsql.Internal;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -15,8 +16,8 @@ static class Statics
     internal static bool LegacyTimestampBehavior;
     internal static bool DisableDateTimeInfinityConversions;
 #else
-        internal static readonly bool LegacyTimestampBehavior;
-        internal static readonly bool DisableDateTimeInfinityConversions;
+    internal static readonly bool LegacyTimestampBehavior;
+    internal static readonly bool DisableDateTimeInfinityConversions;
 #endif
 
     static Statics()
@@ -25,16 +26,28 @@ static class Statics
         DisableDateTimeInfinityConversions = AppContext.TryGetSwitch("Npgsql.DisableDateTimeInfinityConversions", out enabled) && enabled;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static T Expect<T>(IBackendMessage msg, NpgsqlConnector connector)
     {
-        if (msg is T asT)
-            return asT;
+        if (msg.GetType() != typeof(T))
+            ThrowIfMsgWrongType<T>(msg, connector);
 
-        throw connector.Break(
-            new NpgsqlException($"Received backend message {msg.Code} while expecting {typeof(T).Name}. " +
-                                "Please file a bug."));
+        return (T)msg;
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static T ExpectAny<T>(IBackendMessage msg, NpgsqlConnector connector)
+    {
+        if (msg is T t)
+            return t;
+
+        ThrowIfMsgWrongType<T>(msg, connector);
+        return default;
+    }
+
+    [DoesNotReturn]
+    static void ThrowIfMsgWrongType<T>(IBackendMessage msg, NpgsqlConnector connector)
+        => throw connector.Break(
+            new NpgsqlException($"Received backend message {msg.Code} while expecting {typeof(T).Name}. Please file a bug."));
 
     internal static DeferDisposable Defer(Action action) => new(action);
     internal static DeferDisposable<T> Defer<T>(Action<T> action, T arg) => new(action, arg);
@@ -89,8 +102,6 @@ static class PGUtil
     internal static readonly UTF8Encoding UTF8Encoding = new(false, true);
     internal static readonly UTF8Encoding RelaxedUTF8Encoding = new(false, false);
 
-    internal const int BitsInInt = sizeof(int) * 8;
-
     internal static void ValidateBackendMessageCode(BackendMessageCode code)
     {
         switch (code)
@@ -122,13 +133,13 @@ static class PGUtil
         case BackendMessageCode.RowDescription:
             return;
         default:
-            throw new NpgsqlException("Unknown message code: " + code);
+            ThrowUnknownMessageCode(code);
+            return;
         }
-    }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static int RotateShift(int val, int shift)
-        => (val << shift) | (val >> (BitsInInt - shift));
+        static void ThrowUnknownMessageCode(BackendMessageCode code)
+            => ThrowHelper.ThrowNpgsqlException($"Unknown message code: {code}");
+    }
 
     internal static readonly Task<bool> TrueTask = Task.FromResult(true);
     internal static readonly Task<bool> FalseTask = Task.FromResult(false);
@@ -143,9 +154,7 @@ enum FormatCode : short
 static class EnumerableExtensions
 {
     internal static string Join(this IEnumerable<string> values, string separator)
-    {
-        return string.Join(separator, values);
-    }
+        => string.Join(separator, values);
 }
 
 static class ExceptionExtensions
@@ -161,7 +170,7 @@ public readonly struct NpgsqlTimeout
 {
     readonly DateTime _expiration;
 
-    internal static NpgsqlTimeout Infinite = new(TimeSpan.Zero);
+    internal static readonly NpgsqlTimeout Infinite = new(TimeSpan.Zero);
 
     internal NpgsqlTimeout(TimeSpan expiration)
         => _expiration = expiration > TimeSpan.Zero
@@ -173,7 +182,7 @@ public readonly struct NpgsqlTimeout
     internal void Check()
     {
         if (HasExpired)
-            throw new TimeoutException();
+            ThrowHelper.ThrowNpgsqlExceptionWithInnerTimeoutException("The operation has timed out");
     }
 
     internal void CheckAndApply(NpgsqlConnector connector)

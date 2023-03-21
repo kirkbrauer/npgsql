@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using NpgsqlTypes;
 using NUnit.Framework;
+using static Npgsql.Tests.TestUtil;
 
 namespace Npgsql.Tests;
 
@@ -70,6 +71,37 @@ public class PrepareTests: TestBase
         Assert.That(cmd2.IsPrepared, Is.True);
     }
 
+    [Test, IssueLink("https://github.com/npgsql/npgsql/issues/4209")]
+    public async Task Async_cancel_NullReferenceException()
+    {
+        for (var i = 0; i < 10; i++)
+        {
+            using var conn = OpenConnectionAndUnprepare();
+            using var cmd = new NpgsqlCommand("SELECT 1", conn);
+            using var cts = new CancellationTokenSource();
+            using var mre = new ManualResetEventSlim();
+            var cancelTask = Task.Run(() =>
+            {
+                mre.Wait();
+                cts.Cancel();
+            });
+            try
+            {
+                mre.Set();
+                await cmd.PrepareAsync(cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                // There is a race between us checking the cancellation token and the cancellation itself.
+                // If the cancellation happens first, we get OperationCancelledException.
+                // In other case, PrepareAsync will not be cancelled and shouldn't throw any exceptions.
+            }
+            await cancelTask;
+
+            Assert.That(conn.State, Is.EqualTo(ConnectionState.Open));
+        }
+    }
+
     [Test]
     public void Unprepare()
         => Unprepare(false).GetAwaiter().GetResult();
@@ -78,7 +110,7 @@ public class PrepareTests: TestBase
     public Task UnprepareAsync()
         => Unprepare(true);
 
-    private async Task Unprepare(bool async)
+    async Task Unprepare(bool async)
     {
         using var conn = OpenConnectionAndUnprepare();
         AssertNumPreparedStatements(conn, 0);
@@ -184,11 +216,8 @@ public class PrepareTests: TestBase
     [Test, IssueLink("https://github.com/npgsql/npgsql/issues/395")]
     public void Across_close_open_same_connector()
     {
-        var csb = new NpgsqlConnectionStringBuilder(ConnectionString)
-        {
-            ApplicationName = nameof(PrepareTests) + '.' + nameof(Across_close_open_same_connector)
-        };
-        using var conn = OpenConnectionAndUnprepare(csb);
+        using var dataSource = CreateDataSource();
+        using var conn = dataSource.OpenConnection();
         using var cmd = new NpgsqlCommand("SELECT 1", conn);
         cmd.Prepare();
         Assert.That(cmd.IsPrepared, Is.True);
@@ -200,18 +229,14 @@ public class PrepareTests: TestBase
         Assert.That(cmd.ExecuteScalar(), Is.EqualTo(1));
         cmd.Prepare();
         Assert.That(cmd.ExecuteScalar(), Is.EqualTo(1));
-        NpgsqlConnection.ClearPool(conn);
     }
 
     [Test]
     public void Across_close_open_different_connector()
     {
-        var connString = new NpgsqlConnectionStringBuilder(ConnectionString)
-        {
-            ApplicationName = nameof(PrepareTests) + '.' + nameof(Across_close_open_different_connector)
-        }.ToString();
-        using var conn1 = new NpgsqlConnection(connString);
-        using var conn2 = new NpgsqlConnection(connString);
+        using var dataSource = CreateDataSource();
+        using var conn1 = dataSource.CreateConnection();
+        using var conn2 = dataSource.CreateConnection();
         using var cmd = new NpgsqlCommand("SELECT 1", conn1);
         conn1.Open();
         cmd.Prepare();
@@ -225,17 +250,13 @@ public class PrepareTests: TestBase
         Assert.That(cmd.ExecuteScalar(), Is.EqualTo(1));  // Execute unprepared
         cmd.Prepare();
         Assert.That(cmd.ExecuteScalar(), Is.EqualTo(1));
-        NpgsqlConnection.ClearPool(conn1);
     }
 
     [Test]
     public void Reuse_prepared_statement()
     {
-        var connString = new NpgsqlConnectionStringBuilder(ConnectionString)
-        {
-            ApplicationName = nameof(PrepareTests) + '.' + nameof(Reuse_prepared_statement)
-        }.ToString();
-        using var conn1 = OpenConnection(connString);
+        using var dataSource = CreateDataSource();
+        using var conn1 = dataSource.OpenConnection();
         var preparedStatement = "";
         using (var cmd1 = new NpgsqlCommand("SELECT @p", conn1))
         {
@@ -254,7 +275,6 @@ public class PrepareTests: TestBase
             Assert.That(cmd2.InternalBatchCommands[0].PreparedStatement!.Name, Is.EqualTo(preparedStatement));
             Assert.That(cmd2.ExecuteScalar(), Is.EqualTo(8));
         }
-        NpgsqlConnection.ClearPool(conn1);
     }
 
     [Test]
@@ -356,12 +376,12 @@ public class PrepareTests: TestBase
     [Test]
     public void One_command_same_sql_auto_prepare()
     {
-        var csb = new NpgsqlConnectionStringBuilder(ConnectionString)
+        using var dataSource = CreateDataSource(csb =>
         {
-            MaxAutoPrepare = 5,
-            AutoPrepareMinUsages = 2
-        };
-        using var conn = OpenConnectionAndUnprepare(csb);
+            csb.MaxAutoPrepare = 5;
+            csb.AutoPrepareMinUsages = 2;
+        });
+        using var conn = dataSource.OpenConnection();
         var sql = new StringBuilder();
         for (var i = 0; i < 2 + 1; i++)
             sql.Append("SELECT 1;");
@@ -503,12 +523,8 @@ public class PrepareTests: TestBase
     [Test, Description("Basic persistent prepared system scenario. Checks that statement is not deallocated in the backend after connection close.")]
     public void Persistent_across_connections()
     {
-        var connSettings = new NpgsqlConnectionStringBuilder(ConnectionString)
-        {
-            ApplicationName = nameof(Persistent_across_connections)
-        };
-
-        using var conn = OpenConnectionAndUnprepare(connSettings);
+        using var dataSource = CreateDataSource();
+        using var conn = dataSource.OpenConnection();
         var processId = conn.ProcessID;
 
         AssertNumPreparedStatements(conn, 0);
@@ -532,8 +548,6 @@ public class PrepareTests: TestBase
         }
         AssertNumPreparedStatements(conn, 1, "Prepared statement deallocated");
         Assert.That(GetPreparedStatements(conn).Single(), Is.EqualTo(stmtName), "Prepared statement name changed unexpectedly");
-
-        NpgsqlConnection.ClearPool(conn);
     }
 
     [Test, Description("Makes sure that calling Prepare() twice on a command does not deallocate or make a new one after the first prepared statement when command does not change")]
@@ -709,23 +723,60 @@ public class PrepareTests: TestBase
     [Test]
     public void Multiplexing_not_supported()
     {
-        var builder = new NpgsqlConnectionStringBuilder(ConnectionString) { Multiplexing = true };
-        using var conn = OpenConnection(builder);
+        using var dataSource = CreateDataSource(csb => csb.Multiplexing = true);
+        using var conn = dataSource.OpenConnection();
         using var cmd = new NpgsqlCommand("SELECT 1", conn);
 
         Assert.That(() => cmd.Prepare(), Throws.Exception.TypeOf<NotSupportedException>());
         Assert.That(() => conn.UnprepareAll(), Throws.Exception.TypeOf<NotSupportedException>());
     }
 
-    NpgsqlConnection OpenConnectionAndUnprepare(string? connectionString = null)
+    [Test]
+    public async Task Explicitly_prepared_statement_invalidation()
     {
-        var conn = OpenConnection(connectionString);
+        await using var dataSource = CreateDataSource(csb =>
+        {
+            csb.MaxAutoPrepare = 10;
+            csb.AutoPrepareMinUsages = 2;
+        });
+        await using var connection = await dataSource.OpenConnectionAsync();
+        var table = await CreateTempTable(connection, "foo int");
+
+        await using var command = new NpgsqlCommand($"SELECT * FROM {table}", connection);
+        await command.PrepareAsync();
+
+        await connection.ExecuteNonQueryAsync($"ALTER TABLE {table} RENAME COLUMN foo TO bar");
+
+        // Since we've changed the table schema, the next execution of the prepared statement will error with 0A000
+        var exception = Assert.ThrowsAsync<PostgresException>(() => command.ExecuteNonQueryAsync())!;
+        Assert.That(exception.SqlState, Is.EqualTo(PostgresErrorCodes.FeatureNotSupported)); // cached plan must not change result type
+
+        // However, Npgsql should invalidate the prepared statement in this case, so the next execution should work
+        Assert.DoesNotThrowAsync(() => command.ExecuteNonQueryAsync());
+
+        // The command is unprepared, though. It's the user's responsibility to re-prepare if they wish.
+        Assert.False(command.IsPrepared);
+    }
+
+    [Test, IssueLink("https://github.com/npgsql/npgsql/issues/4920")]
+    public async Task Explicit_prepare_unprepare_many_queries()
+    {
+        // Set a specific buffer's size to trigger #4920
+        await using var dataSource = CreateDataSource(csb => csb.WriteBufferSize = 5002);
+        await using var conn = await dataSource.OpenConnectionAsync();
+        await using var cmd = conn.CreateCommand();
+
+        cmd.CommandText = string.Join(';', Enumerable.Range(1, 500).Select(x => $"SELECT {x}"));
+        await cmd.PrepareAsync();
+        await cmd.UnprepareAsync();
+    }
+
+    NpgsqlConnection OpenConnectionAndUnprepare()
+    {
+        var conn = OpenConnection();
         conn.UnprepareAll();
         return conn;
     }
-
-    NpgsqlConnection OpenConnectionAndUnprepare(NpgsqlConnectionStringBuilder csb)
-        => OpenConnectionAndUnprepare(csb.ToString());
 
     void AssertNumPreparedStatements(NpgsqlConnection conn, int expected)
         => Assert.That(conn.ExecuteScalar("SELECT COUNT(*) FROM pg_prepared_statements WHERE statement NOT LIKE '%FROM pg_prepared_statements%'"), Is.EqualTo(expected));

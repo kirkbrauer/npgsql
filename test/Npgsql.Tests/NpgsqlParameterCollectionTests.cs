@@ -7,9 +7,11 @@ using System.Diagnostics.CodeAnalysis;
 
 namespace Npgsql.Tests;
 
-[NonParallelizable] // This test class has global effects on case sensitive matching in param collection.
 [TestFixture(CompatMode.OnePass)]
+#if DEBUG
 [TestFixture(CompatMode.TwoPass)]
+[NonParallelizable] // This test class has global effects on case sensitive matching in param collection.
+#endif
 public class NpgsqlParameterCollectionTests
 {
     readonly CompatMode _compatMode;
@@ -316,8 +318,8 @@ public class NpgsqlParameterCollectionTests
 #if DEBUG
         NpgsqlParameterCollection.TwoPassCompatMode = compatMode == CompatMode.TwoPass;
 #else
-            if (compatMode == CompatMode.TwoPass)
-                Assert.Ignore("Cannot test case-insensitive NpgsqlParameterCollection behavior in RELEASE");
+        if (compatMode == CompatMode.TwoPass)
+            Assert.Ignore("Cannot test case-insensitive NpgsqlParameterCollection behavior in RELEASE");
 #endif
     }
 

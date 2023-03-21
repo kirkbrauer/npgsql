@@ -29,7 +29,6 @@ public abstract class ReplicationConnection : IAsyncDisposable
     static readonly Version FirstVersionWithTwoPhaseSupport = new(15, 0);
     static readonly Version FirstVersionWithoutDropSlotDoubleCommandCompleteMessage = new(13, 0);
     static readonly Version FirstVersionWithTemporarySlotsAndSlotSnapshotInitMode = new(10, 0);
-    internal static readonly ILogger Logger = NpgsqlLoggingConfiguration.ReplicationLogger;
     readonly NpgsqlConnection _npgsqlConnection;
     readonly SemaphoreSlim _feedbackSemaphore = new(1, 1);
     string? _userFacingConnectionString;
@@ -54,6 +53,8 @@ public abstract class ReplicationConnection : IAsyncDisposable
     long _lastAppliedLsn;
 
     readonly XLogDataMessage _cachedXLogDataMessage = new();
+
+    internal ILogger ReplicationLogger { get; private set; } = default!; // Initialized in Open, shouldn't be used otherwise
 
     #endregion Fields
 
@@ -234,13 +235,14 @@ public abstract class ReplicationConnection : IAsyncDisposable
     {
         CheckDisposed();
 
-        await _npgsqlConnection.OpenAsync(cancellationToken)
-            .ConfigureAwait(false);
+        await _npgsqlConnection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
         // PG versions before 10 ignore cancellations during replication
-        _pgCancellationSupported = _npgsqlConnection.PostgreSqlVersion.IsGreaterOrEqual(10, 0);
+        _pgCancellationSupported = _npgsqlConnection.PostgreSqlVersion.IsGreaterOrEqual(10);
 
         SetTimeouts(CommandTimeout, CommandTimeout);
+
+        ReplicationLogger = _npgsqlConnection.Connector!.LoggingConfiguration.ReplicationLogger;
     }
 
     /// <summary>
@@ -450,6 +452,8 @@ public abstract class ReplicationConnection : IAsyncDisposable
         using var _ = Connector.StartUserAction(
             ConnectorState.Replication, _replicationCancellationTokenSource.Token, attemptPgCancellation: _pgCancellationSupported);
 
+        NpgsqlReadBuffer.ColumnStream? columnStream = null;
+
         try
         {
             await connector.WriteQuery(command, true, cancellationToken);
@@ -471,7 +475,7 @@ public abstract class ReplicationConnection : IAsyncDisposable
             var buf = connector.ReadBuffer;
 
             // Cancellation is handled at the replication level - we don't want every ReadAsync
-            var columnStream = new NpgsqlReadBuffer.ColumnStream(connector, startCancellableOperations: false);
+            columnStream = new NpgsqlReadBuffer.ColumnStream(connector, startCancellableOperations: false);
 
             SetTimeouts(_walReceiverTimeout, CommandTimeout);
 
@@ -497,7 +501,7 @@ public abstract class ReplicationConnection : IAsyncDisposable
                     await buf.EnsureAsync(24);
                     var startLsn = buf.ReadUInt64();
                     var endLsn = buf.ReadUInt64();
-                    var sendTime = DateTimeUtils.DecodeTimestamp(buf.ReadInt64(), DateTimeKind.Unspecified).ToLocalTime();
+                    var sendTime = DateTimeUtils.DecodeTimestamp(buf.ReadInt64(), DateTimeKind.Utc);
 
                     if (unchecked((ulong)Interlocked.Read(ref _lastReceivedLsn)) < startLsn)
                         Interlocked.Exchange(ref _lastReceivedLsn, unchecked((long)startLsn));
@@ -525,11 +529,11 @@ public abstract class ReplicationConnection : IAsyncDisposable
                     await buf.EnsureAsync(17);
                     var end = buf.ReadUInt64();
 
-                    if (Logger.IsEnabled(LogLevel.Trace))
+                    if (ReplicationLogger.IsEnabled(LogLevel.Trace))
                     {
                         var endLsn = new NpgsqlLogSequenceNumber(end);
                         var timestamp = DateTimeUtils.DecodeTimestamp(buf.ReadInt64(), DateTimeKind.Utc);
-                        LogMessages.ReceivedReplicationPrimaryKeepalive(Logger, endLsn, timestamp, Connector.Id);
+                        LogMessages.ReceivedReplicationPrimaryKeepalive(ReplicationLogger, endLsn, timestamp, Connector.Id);
                     }
                     else
                         buf.Skip(8);
@@ -540,7 +544,7 @@ public abstract class ReplicationConnection : IAsyncDisposable
 
                     if (replyRequested)
                     {
-                        LogMessages.SendingReplicationStandbyStatusUpdate(Logger, "the server requested it", Connector.Id);
+                        LogMessages.SendingReplicationStandbyStatusUpdate(ReplicationLogger, "the server requested it", Connector.Id);
                         await SendFeedback(waitOnSemaphore: true, cancellationToken: CancellationToken.None);
                     }
 
@@ -554,24 +558,27 @@ public abstract class ReplicationConnection : IAsyncDisposable
         }
         finally
         {
-#if NETSTANDARD2_0
-                if (_sendFeedbackTimer != null)
-                {
-                    var mre = new ManualResetEvent(false);
-                    var actuallyDisposed = _sendFeedbackTimer.Dispose(mre);
-                    Debug.Assert(actuallyDisposed, $"{nameof(_sendFeedbackTimer)} had already been disposed when completing replication");
-                    if (actuallyDisposed)
-                        await mre.WaitOneAsync(cancellationToken);
-                }
+            if (columnStream != null && !bypassingStream && !_replicationCancellationTokenSource.Token.IsCancellationRequested)
+                await columnStream.DisposeAsync();
 
-                if (_requestFeedbackTimer != null)
-                {
-                    var mre = new ManualResetEvent(false);
-                    var actuallyDisposed = _requestFeedbackTimer.Dispose(mre);
-                    Debug.Assert(actuallyDisposed, $"{nameof(_requestFeedbackTimer)} had already been disposed when completing replication");
-                    if (actuallyDisposed)
-                        await mre.WaitOneAsync(cancellationToken);
-                }
+#if NETSTANDARD2_0
+            if (_sendFeedbackTimer != null)
+            {
+                var mre = new ManualResetEvent(false);
+                var actuallyDisposed = _sendFeedbackTimer.Dispose(mre);
+                Debug.Assert(actuallyDisposed, $"{nameof(_sendFeedbackTimer)} had already been disposed when completing replication");
+                if (actuallyDisposed)
+                    await mre.WaitOneAsync(cancellationToken);
+            }
+
+            if (_requestFeedbackTimer != null)
+            {
+                var mre = new ManualResetEvent(false);
+                var actuallyDisposed = _requestFeedbackTimer.Dispose(mre);
+                Debug.Assert(actuallyDisposed, $"{nameof(_requestFeedbackTimer)} had already been disposed when completing replication");
+                if (actuallyDisposed)
+                    await mre.WaitOneAsync(cancellationToken);
+            }
 #else
 
             if (_sendFeedbackTimer != null)
@@ -634,7 +641,7 @@ public abstract class ReplicationConnection : IAsyncDisposable
             if (Connector.State != ConnectorState.Replication)
                 throw new InvalidOperationException("Status update can only be sent during replication");
 
-            LogMessages.SendingReplicationStandbyStatusUpdate(Logger, nameof(SendStatusUpdate) + "was called", Connector.Id);
+            LogMessages.SendingReplicationStandbyStatusUpdate(ReplicationLogger, nameof(SendStatusUpdate) + "was called", Connector.Id);
             await SendFeedback(waitOnSemaphore: true, cancellationToken: cancellationToken);
         }
     }
@@ -647,7 +654,7 @@ public abstract class ReplicationConnection : IAsyncDisposable
 
         if (!taken)
         {
-            Logger.LogTrace($"Aborting feedback due to expired {nameof(WalReceiverStatusInterval)} because of a concurrent feedback request");
+            ReplicationLogger.LogTrace($"Aborting feedback due to expired {nameof(WalReceiverStatusInterval)} because of a concurrent feedback request");
             return;
         }
 
@@ -677,10 +684,10 @@ public abstract class ReplicationConnection : IAsyncDisposable
 
             await connector.Flush(async: true, cancellationToken);
 
-            if (Logger.IsEnabled(LogLevel.Trace))
+            if (ReplicationLogger.IsEnabled(LogLevel.Trace))
             {
                 LogMessages.SentReplicationFeedbackMessage(
-                    Logger,
+                    ReplicationLogger,
                     new NpgsqlLogSequenceNumber(unchecked((ulong)lastReceivedLsn)),
                     new NpgsqlLogSequenceNumber(unchecked((ulong)lastFlushedLsn)),
                     new NpgsqlLogSequenceNumber(unchecked((ulong)lastAppliedLsn)),
@@ -690,7 +697,7 @@ public abstract class ReplicationConnection : IAsyncDisposable
         }
         catch (Exception e)
         {
-            LogMessages.ReplicationFeedbackMessageSendingFailed(Logger, _npgsqlConnection?.Connector?.Id, e);
+            LogMessages.ReplicationFeedbackMessageSendingFailed(ReplicationLogger, _npgsqlConnection?.Connector?.Id, e);
         }
         finally
         {
@@ -708,8 +715,8 @@ public abstract class ReplicationConnection : IAsyncDisposable
             if (Connector.State != ConnectorState.Replication)
                 return;
 
-            if (Logger.IsEnabled(LogLevel.Trace))
-                LogMessages.SendingReplicationStandbyStatusUpdate(Logger, $"half of the {nameof(WalReceiverTimeout)} of {WalReceiverTimeout} has expired", Connector.Id);
+            if (ReplicationLogger.IsEnabled(LogLevel.Trace))
+                LogMessages.SendingReplicationStandbyStatusUpdate(ReplicationLogger, $"half of the {nameof(WalReceiverTimeout)} of {WalReceiverTimeout} has expired", Connector.Id);
 
             await SendFeedback(waitOnSemaphore: true, requestReply: true);
         }
@@ -726,8 +733,8 @@ public abstract class ReplicationConnection : IAsyncDisposable
             if (Connector.State != ConnectorState.Replication)
                 return;
 
-            if (Logger.IsEnabled(LogLevel.Trace))
-                LogMessages.SendingReplicationStandbyStatusUpdate(Logger, $"{nameof(WalReceiverStatusInterval)} of {WalReceiverStatusInterval} has expired", Connector.Id);
+            if (ReplicationLogger.IsEnabled(LogLevel.Trace))
+                LogMessages.SendingReplicationStandbyStatusUpdate(ReplicationLogger, $"{nameof(WalReceiverStatusInterval)} of {WalReceiverStatusInterval} has expired", Connector.Id);
 
             await SendFeedback();
         }
@@ -769,7 +776,7 @@ public abstract class ReplicationConnection : IAsyncDisposable
             if (wait)
                 command += " WAIT";
 
-            LogMessages.DroppingReplicationSlot(Logger, slotName, command, Connector.Id);
+            LogMessages.DroppingReplicationSlot(ReplicationLogger, slotName, command, Connector.Id);
 
             await Connector.WriteQuery(command, true, CancellationToken.None);
             await Connector.Flush(true, CancellationToken.None);
@@ -792,7 +799,7 @@ public abstract class ReplicationConnection : IAsyncDisposable
 
         using var _ = Connector.StartUserAction(cancellationToken, attemptPgCancellation: _pgCancellationSupported);
 
-        LogMessages.ExecutingReplicationCommand(Logger, command, Connector.Id);
+        LogMessages.ExecutingReplicationCommand(ReplicationLogger, command, Connector.Id);
 
         await Connector.WriteQuery(command, true, cancellationToken);
         await Connector.Flush(true, cancellationToken);

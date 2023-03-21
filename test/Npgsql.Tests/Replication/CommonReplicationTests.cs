@@ -22,12 +22,9 @@ public class CommonReplicationTests<TConnection> : SafeReplicationTestBase<TConn
 {
     #region Open
 
-    [Test, Parallelizable(ParallelScope.None)]
+    [Test, NonParallelizable]
     public async Task Open()
     {
-        // Force type reloading from the replication connection if it is a logical replication connection
-        if (typeof(TConnection) == typeof(LogicalReplicationConnection))
-            Internal.NpgsqlDatabaseInfo.Cache.Clear();
         await using var rc = await OpenReplicationConnectionAsync();
     }
 
@@ -320,10 +317,8 @@ public class CommonReplicationTests<TConnection> : SafeReplicationTestBase<TConn
                 // will occupy the connection it is bound to.
                 var insertTask = Task.Run(async () =>
                 {
-                    await using var insertConn = await OpenConnectionAsync(new NpgsqlConnectionStringBuilder(ConnectionString)
-                    {
-                        Options = "-c synchronous_commit=on"
-                    });
+                    await using var dataSource = CreateDataSource(csb => csb.Options = "-c synchronous_commit=on");
+                    await using var insertConn = await dataSource.OpenConnectionAsync();
                     await insertConn.ExecuteNonQueryAsync($"INSERT INTO {tableName} (name) VALUES ('{value1String}')");
                 });
 
@@ -356,10 +351,8 @@ public class CommonReplicationTests<TConnection> : SafeReplicationTestBase<TConn
                 var value2String = Guid.NewGuid().ToString("B");
                 insertTask = Task.Run(async () =>
                 {
-                    await using var insertConn = OpenConnection(new NpgsqlConnectionStringBuilder(ConnectionString)
-                    {
-                        Options = "-c synchronous_commit=remote_apply"
-                    });
+                    await using var dataSource = CreateDataSource(csb => csb.Options = "-c synchronous_commit=remote_apply");
+                    await using var insertConn = await dataSource.OpenConnectionAsync();
                     await insertConn.ExecuteNonQueryAsync($"INSERT INTO {tableName} (name) VALUES ('{value2String}')");
                 });
 
@@ -385,10 +378,8 @@ public class CommonReplicationTests<TConnection> : SafeReplicationTestBase<TConn
                 var value3String = Guid.NewGuid().ToString("B");
                 insertTask = Task.Run(async () =>
                 {
-                    await using var insertConn = OpenConnection(new NpgsqlConnectionStringBuilder(ConnectionString)
-                    {
-                        Options = "-c synchronous_commit=remote_write"
-                    });
+                    await using var dataSource = CreateDataSource(csb => csb.Options = "-c synchronous_commit=remote_write");
+                    await using var insertConn = await dataSource.OpenConnectionAsync();
                     await insertConn.ExecuteNonQueryAsync($"INSERT INTO {tableName} (name) VALUES ('{value3String}')");
                 });
 

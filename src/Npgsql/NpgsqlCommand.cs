@@ -9,15 +9,15 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Globalization;
 using Npgsql.BackendMessages;
 using Npgsql.Util;
 using NpgsqlTypes;
 using static Npgsql.Util.Statics;
-using System.Collections;
 using System.Diagnostics.CodeAnalysis;
+using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using Npgsql.Internal;
+using Npgsql.Properties;
 
 namespace Npgsql;
 
@@ -27,11 +27,11 @@ namespace Npgsql;
 /// </summary>
 // ReSharper disable once RedundantNameQualifier
 [System.ComponentModel.DesignerCategory("")]
-public sealed class NpgsqlCommand : DbCommand, ICloneable, IComponent
+public class NpgsqlCommand : DbCommand, ICloneable, IComponent
 {
     #region Fields
 
-    NpgsqlConnection? _connection;
+    NpgsqlTransaction? _transaction;
 
     readonly NpgsqlConnector? _connector;
 
@@ -70,19 +70,21 @@ public sealed class NpgsqlCommand : DbCommand, ICloneable, IComponent
     /// <summary>
     /// Whether this command is cached by <see cref="NpgsqlConnection" /> and returned by <see cref="NpgsqlConnection.CreateCommand" />.
     /// </summary>
-    internal bool IsCached { get; set; }
+    internal bool IsCacheable { get; set; }
 
 #if DEBUG
     internal static bool EnableSqlRewriting;
+    internal static bool EnableStoredProcedureCompatMode;
 #else
     internal static readonly bool EnableSqlRewriting;
+    internal static readonly bool EnableStoredProcedureCompatMode;
 #endif
+
+    internal bool EnableErrorBarriers { get; set; }
 
     static readonly List<NpgsqlParameter> EmptyParameters = new();
 
     static readonly SingleThreadSynchronizationContext SingleThreadSynchronizationContext = new("NpgsqlRemainingAsyncSendWorker");
-
-    static readonly ILogger Logger = NpgsqlLoggingConfiguration.CommandLogger;
 
     #endregion Fields
 
@@ -95,7 +97,10 @@ public sealed class NpgsqlCommand : DbCommand, ICloneable, IComponent
     #region Constructors
 
     static NpgsqlCommand()
-        => EnableSqlRewriting = !AppContext.TryGetSwitch("Npgsql.EnableSqlRewriting", out var enabled) || enabled;
+    {
+        EnableSqlRewriting = !AppContext.TryGetSwitch("Npgsql.EnableSqlRewriting", out var enabled) || enabled;
+        EnableStoredProcedureCompatMode = AppContext.TryGetSwitch("Npgsql.EnableStoredProcedureCompatMode", out enabled) && enabled;
+    }
 
     /// <summary>
     /// Initializes a new instance of the <see cref="NpgsqlCommand"/> class.
@@ -116,7 +121,15 @@ public sealed class NpgsqlCommand : DbCommand, ICloneable, IComponent
     /// <param name="cmdText">The text of the query.</param>
     /// <param name="connection">A <see cref="NpgsqlConnection"/> that represents the connection to a PostgreSQL server.</param>
     // ReSharper disable once IntroduceOptionalParameters.Global
-    public NpgsqlCommand(string? cmdText, NpgsqlConnection? connection) : this(cmdText, connection, null) {}
+    public NpgsqlCommand(string? cmdText, NpgsqlConnection? connection)
+    {
+        GC.SuppressFinalize(this);
+        InternalBatchCommands = new List<NpgsqlBatchCommand>(1);
+        _parameters = new NpgsqlParameterCollection();
+        _commandText = cmdText ?? string.Empty;
+        InternalConnection = connection;
+        CommandType = CommandType.Text;
+    }
 
     /// <summary>
     /// Initializes a new instance of the <see cref="NpgsqlCommand"/> class with the text of the query, a
@@ -126,23 +139,17 @@ public sealed class NpgsqlCommand : DbCommand, ICloneable, IComponent
     /// <param name="connection">A <see cref="NpgsqlConnection"/> that represents the connection to a PostgreSQL server.</param>
     /// <param name="transaction">The <see cref="NpgsqlTransaction"/> in which the <see cref="NpgsqlCommand"/> executes.</param>
     public NpgsqlCommand(string? cmdText, NpgsqlConnection? connection, NpgsqlTransaction? transaction)
-    {
-        GC.SuppressFinalize(this);
-        InternalBatchCommands = new List<NpgsqlBatchCommand>(1);
-        _parameters = new NpgsqlParameterCollection();
-        _commandText = cmdText ?? string.Empty;
-        _connection = connection;
-        Transaction = transaction;
-        CommandType = CommandType.Text;
-    }
+        : this(cmdText, connection)
+        => Transaction = transaction;
 
     /// <summary>
     /// Used when this <see cref="NpgsqlCommand"/> instance is wrapped inside an <see cref="NpgsqlBatch"/>.
     /// </summary>
-    internal NpgsqlCommand(List<NpgsqlBatchCommand> batchCommands)
+    internal NpgsqlCommand(int batchCommandCapacity, NpgsqlConnection? connection = null)
     {
         GC.SuppressFinalize(this);
-        InternalBatchCommands = batchCommands;
+        InternalBatchCommands = new List<NpgsqlBatchCommand>(batchCommandCapacity);
+        InternalConnection = connection;
         CommandType = CommandType.Text;
         IsWrappedByBatch = true;
 
@@ -157,12 +164,12 @@ public sealed class NpgsqlCommand : DbCommand, ICloneable, IComponent
     /// <summary>
     /// Used when this <see cref="NpgsqlCommand"/> instance is wrapped inside an <see cref="NpgsqlBatch"/>.
     /// </summary>
-    internal NpgsqlCommand(NpgsqlConnector connector, List<NpgsqlBatchCommand> batchCommands)
-        : this(batchCommands)
+    internal NpgsqlCommand(NpgsqlConnector connector, int batchCommandCapacity)
+        : this(batchCommandCapacity)
         => _connector = connector;
 
     internal static NpgsqlCommand CreateCachedCommand(NpgsqlConnection connection)
-        => new(null, connection) { IsCached = true };
+        => new(null, connection) { IsCacheable = true };
 
     #endregion Constructors
 
@@ -171,7 +178,7 @@ public sealed class NpgsqlCommand : DbCommand, ICloneable, IComponent
     /// <summary>
     /// Gets or sets the SQL statement or function (stored procedure) to execute at the data source.
     /// </summary>
-    /// <value>The Transact-SQL statement or stored procedure to execute. The default is an empty string.</value>
+    /// <value>The SQL statement or function (stored procedure) to execute. The default is an empty string.</value>
     [AllowNull, DefaultValue("")]
     [Category("Data")]
     public override string CommandText
@@ -181,11 +188,12 @@ public sealed class NpgsqlCommand : DbCommand, ICloneable, IComponent
         {
             Debug.Assert(!IsWrappedByBatch);
 
-            _commandText = State == CommandState.Idle
-                ? value ?? string.Empty
-                : throw new InvalidOperationException("An open data reader exists for this command.");
+            if (State != CommandState.Idle)
+                ThrowHelper.ThrowInvalidOperationException("An open data reader exists for this command.");
 
-            ResetExplicitPreparation();
+            _commandText = value ?? string.Empty;
+
+            ResetPreparation();
             // TODO: Technically should do this also if the parameter list (or type) changes
         }
     }
@@ -197,7 +205,7 @@ public sealed class NpgsqlCommand : DbCommand, ICloneable, IComponent
     [DefaultValue(DefaultTimeout)]
     public override int CommandTimeout
     {
-        get => _timeout ?? (_connection?.CommandTimeout ?? DefaultTimeout);
+        get => _timeout ?? (InternalConnection?.CommandTimeout ?? DefaultTimeout);
         set
         {
             if (value < 0) {
@@ -218,13 +226,25 @@ public sealed class NpgsqlCommand : DbCommand, ICloneable, IComponent
     [Category("Data")]
     public override CommandType CommandType { get; set; }
 
+    internal NpgsqlConnection? InternalConnection { get; private set; }
+
     /// <summary>
     /// DB connection.
     /// </summary>
     protected override DbConnection? DbConnection
     {
-        get => _connection;
-        set => _connection = (NpgsqlConnection?)value;
+        get => InternalConnection;
+        set
+        {
+            if (InternalConnection == value)
+                return;
+
+            InternalConnection = State == CommandState.Idle
+                ? (NpgsqlConnection?)value
+                : throw new InvalidOperationException("An open data reader exists for this command.");
+
+            Transaction = null;
+        }
     }
 
     /// <summary>
@@ -235,18 +255,8 @@ public sealed class NpgsqlCommand : DbCommand, ICloneable, IComponent
     [Category("Behavior")]
     public new NpgsqlConnection? Connection
     {
-        get => _connection;
-        set
-        {
-            if (_connection == value)
-                return;
-
-            _connection = State == CommandState.Idle
-                ? value
-                : throw new InvalidOperationException("An open data reader exists for this command.");
-
-            Transaction = null;
-        }
+        get => (NpgsqlConnection?)DbConnection;
+        set => DbConnection = value;
     }
 
     /// <summary>
@@ -284,7 +294,7 @@ public sealed class NpgsqlCommand : DbCommand, ICloneable, IComponent
     /// Returns whether this query will execute as a prepared (compiled) query.
     /// </summary>
     public bool IsPrepared =>
-        _connectorPreparedOn == (_connection?.Connector ?? _connector) &&
+        _connectorPreparedOn == (InternalConnection?.Connector ?? _connector) &&
         InternalBatchCommands.Any() && InternalBatchCommands.All(s => s.PreparedStatement?.IsPrepared == true);
 
     #endregion Public properties
@@ -293,7 +303,7 @@ public sealed class NpgsqlCommand : DbCommand, ICloneable, IComponent
 
     /// <summary>
     /// Marks all of the query's result columns as either known or unknown.
-    /// Unknown results column are requested them from PostgreSQL in text format, and Npgsql makes no
+    /// Unknown result columns are requested from PostgreSQL in text format, and Npgsql makes no
     /// attempt to parse them. They will be accessible as strings only.
     /// </summary>
     public bool AllResultTypesAreUnknown
@@ -311,7 +321,7 @@ public sealed class NpgsqlCommand : DbCommand, ICloneable, IComponent
 
     /// <summary>
     /// Marks the query's result columns as known or unknown, on a column-by-column basis.
-    /// Unknown results column are requested them from PostgreSQL in text format, and Npgsql makes no
+    /// Unknown result columns are requested from PostgreSQL in text format, and Npgsql makes no
     /// attempt to parse them. They will be accessible as strings only.
     /// </summary>
     /// <remarks>
@@ -367,7 +377,7 @@ public sealed class NpgsqlCommand : DbCommand, ICloneable, IComponent
         }
     }
 
-    void ResetExplicitPreparation() => _connectorPreparedOn = null;
+    internal void ResetPreparation() => _connectorPreparedOn = null;
 
     #endregion State management
 
@@ -455,7 +465,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
 
     void DeriveParametersForFunction()
     {
-        using var c = new NpgsqlCommand(DeriveParametersForFunctionQuery, _connection);
+        using var c = new NpgsqlCommand(DeriveParametersForFunctionQuery, InternalConnection);
         c.Parameters.Add(new NpgsqlParameter("proname", NpgsqlDbType.Text));
         c.Parameters[0].Value = CommandText;
 
@@ -484,7 +494,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
                 throw new InvalidOperationException($"{CommandText} does not exist in pg_proc");
         }
 
-        var typeMapper = c._connection!.Connector!.TypeMapper;
+        var typeMapper = c.InternalConnection!.Connector!.TypeMapper;
 
         for (var i = 0; i < types.Length; i++)
         {
@@ -525,7 +535,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
     {
         using (connector.StartUserAction())
         {
-            LogMessages.DerivingParameters(Logger, CommandText, connector.Id);
+            LogMessages.DerivingParameters(connector.CommandLogger, CommandText, connector.Id);
 
             if (IsWrappedByBatch)
                 foreach (var batchCommand in InternalBatchCommands)
@@ -610,7 +620,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
     /// An optional token to cancel the asynchronous operation. The default value is <see cref="CancellationToken.None"/>.
     /// </param>
 #if NETSTANDARD2_0
-        public Task PrepareAsync(CancellationToken cancellationToken = default)
+    public virtual Task PrepareAsync(CancellationToken cancellationToken = default)
 #else
     public override Task PrepareAsync(CancellationToken cancellationToken = default)
 #endif
@@ -626,6 +636,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
         if (connection.Settings.Multiplexing)
             throw new NotSupportedException("Explicit preparation not supported with multiplexing");
         var connector = connection.Connector!;
+        var logger = connector.CommandLogger;
 
         var needToPrepare = false;
 
@@ -633,25 +644,25 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
         {
             foreach (var batchCommand in InternalBatchCommands)
             {
-                batchCommand.Parameters.ProcessParameters(connector.TypeMapper, validate: false);
+                batchCommand.Parameters.ProcessParameters(connector.TypeMapper, validateValues: false, CommandType);
                 ProcessRawQuery(connector.SqlQueryParser, connector.UseConformingStrings, batchCommand);
 
                 needToPrepare = batchCommand.ExplicitPrepare(connector) || needToPrepare;
             }
 
-            if (Logger.IsEnabled(LogLevel.Debug) && needToPrepare)
-                LogMessages.PreparingCommandExplicitly(Logger, string.Join("; ", InternalBatchCommands.Select(c => c.CommandText)), connector.Id);
+            if (logger.IsEnabled(LogLevel.Debug) && needToPrepare)
+                LogMessages.PreparingCommandExplicitly(logger, string.Join("; ", InternalBatchCommands.Select(c => c.CommandText)), connector.Id);
         }
         else
         {
-            Parameters.ProcessParameters(connector.TypeMapper, validate: false);
+            Parameters.ProcessParameters(connector.TypeMapper, validateValues: false, CommandType);
             ProcessRawQuery(connector.SqlQueryParser, connector.UseConformingStrings, batchCommand: null);
 
             foreach (var batchCommand in InternalBatchCommands)
                 needToPrepare = batchCommand.ExplicitPrepare(connector) || needToPrepare;
 
-            if (Logger.IsEnabled(LogLevel.Debug) && needToPrepare)
-                LogMessages.PreparingCommandExplicitly(Logger, CommandText, connector.Id);
+            if (logger.IsEnabled(LogLevel.Debug) && needToPrepare)
+                LogMessages.PreparingCommandExplicitly(logger, CommandText, connector.Id);
         }
 
         _connectorPreparedOn = connector;
@@ -668,7 +679,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
             {
                 using (connector.StartUserAction(cancellationToken))
                 {
-                    var sendTask = command.SendPrepare(connector, async, cancellationToken);
+                    var sendTask = command.SendPrepare(connector, async, CancellationToken.None);
                     if (sendTask.IsFaulted)
                         sendTask.GetAwaiter().GetResult();
 
@@ -721,7 +732,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
                         sendTask.GetAwaiter().GetResult();
                 }
 
-                LogMessages.CommandPreparedExplicitly(Logger, connector.Id);
+                LogMessages.CommandPreparedExplicitly(connector.CommandLogger, connector.Id);
             }
             catch
             {
@@ -773,7 +784,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
 
         var connector = connection.Connector!;
 
-        LogMessages.UnpreparingCommand(Logger, connector.Id);
+        LogMessages.UnpreparingCommand(connector.CommandLogger, connector.Id);
 
         using (connector.StartUserAction(cancellationToken))
         {
@@ -817,7 +828,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
             : (batchCommand.CommandText, batchCommand.CommandType, batchCommand.Parameters);
 
         if (string.IsNullOrEmpty(commandText))
-            throw new InvalidOperationException("CommandText property has not been initialized");
+            ThrowHelper.ThrowInvalidOperationException("CommandText property has not been initialized");
 
         switch (commandType)
         {
@@ -848,12 +859,11 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
                 // like queries with named parameters, since they may contain a semicolon (legacy batching).
                 if (EnableSqlRewriting)
                     goto case PlaceholderType.Named;
-                else
-                    goto case PlaceholderType.Positional;
+                goto case PlaceholderType.Positional;
 
             case PlaceholderType.Named:
                 if (!EnableSqlRewriting)
-                    throw new NotSupportedException($"Named parameters are not supported when Npgsql.{nameof(EnableSqlRewriting)} is disabled");
+                    ThrowHelper.ThrowNotSupportedException($"Named parameters are not supported when Npgsql.{nameof(EnableSqlRewriting)} is disabled");
 
                 // The parser is cached on NpgsqlConnector - unless we're in multiplexing mode.
                 parser ??= new SqlQueryParser();
@@ -862,7 +872,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
                 {
                     parser.ParseRawQuery(this, standardConformingStrings);
                     if (InternalBatchCommands.Count > 1 && _parameters.HasOutputParameters)
-                        throw new NotSupportedException("Commands with multiple queries cannot have out parameters");
+                        ThrowHelper.ThrowNotSupportedException("Commands with multiple queries cannot have out parameters");
                     for (var i = 0; i < InternalBatchCommands.Count; i++)
                         ValidateParameterCount(InternalBatchCommands[i]);
                 }
@@ -870,18 +880,19 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
                 {
                     parser.ParseRawQuery(batchCommand, standardConformingStrings);
                     if (batchCommand.Parameters.HasOutputParameters)
-                        throw new NotSupportedException("Batches cannot cannot have out parameters");
+                        ThrowHelper.ThrowNotSupportedException("Batches cannot cannot have out parameters");
                     ValidateParameterCount(batchCommand);
                 }
 
                 break;
 
             case PlaceholderType.Mixed:
-                throw new NotSupportedException("Mixing named and positional parameters isn't supported");
+                ThrowHelper.ThrowNotSupportedException("Mixing named and positional parameters isn't supported");
+                break;
 
             default:
-                throw new ArgumentOutOfRangeException(
-                    nameof(PlaceholderType), $"Unknown {nameof(PlaceholderType)} value: {Parameters.PlaceholderType}");
+                ThrowHelper.ThrowArgumentOutOfRangeException(nameof(PlaceholderType), $"Unknown {nameof(PlaceholderType)} value: {{0}}", Parameters.PlaceholderType);
+                break;
             }
 
             break;
@@ -892,56 +903,71 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
             break;
 
         case CommandType.StoredProcedure:
-            var inputList = parameters.Where(p => p.IsInputDirection).ToList();
-            var numInput = inputList.Count;
-            var sb = new StringBuilder();
-            sb.Append("SELECT * FROM ");
-            sb.Append(CommandText);
-            sb.Append('(');
-            var hasWrittenFirst = false;
-            for (var i = 1; i <= numInput; i++) {
-                var param = inputList[i - 1];
-                if (param.IsPositional)
-                {
-                    if (hasWrittenFirst)
-                        sb.Append(',');
-                    sb.Append('$');
-                    sb.Append(i);
-                    hasWrittenFirst = true;
-                }
-            }
-            for (var i = 1; i <= numInput; i++)
+            var sqlBuilder = new StringBuilder()
+                .Append(EnableStoredProcedureCompatMode ? "SELECT * FROM " : "CALL ")
+                .Append(CommandText)
+                .Append('(');
+
+            var isFirstParam = true;
+            var seenNamedParam = false;
+            var inputParameters = new List<NpgsqlParameter>(parameters.Count);
+
+            for (var i = 0; i < parameters.Count; i++)
             {
-                var param = inputList[i - 1];
-                if (!param.IsPositional)
+                var parameter = parameters[i];
+
+                // With functions, output parameters are never present when calling the function (they only define the schema of the
+                // returned table). With stored procedures they must be specified in the CALL argument list (see below).
+                if (EnableStoredProcedureCompatMode && parameter.Direction == ParameterDirection.Output)
+                    continue;
+
+                if (isFirstParam)
+                    isFirstParam = false;
+                else
+                    sqlBuilder.Append(", ");
+
+                if (parameter.IsPositional)
                 {
-                    if (hasWrittenFirst)
-                        sb.Append(',');
-                    sb.Append('"');
-                    sb.Append(param.TrimmedName.Replace("\"", "\"\""));
-                    sb.Append("\" := ");
-                    sb.Append('$');
-                    sb.Append(i);
-                    hasWrittenFirst = true;
+                    if (seenNamedParam)
+                        ThrowHelper.ThrowArgumentException(NpgsqlStrings.PositionalParameterAfterNamed);
+                }
+                else
+                {
+                    seenNamedParam = true;
+
+                    sqlBuilder
+                        .Append('"')
+                        .Append(parameter.TrimmedName.Replace("\"", "\"\""))
+                        .Append("\" := ");
+                }
+
+                if (parameter.Direction == ParameterDirection.Output)
+                    sqlBuilder.Append("NULL");
+                else
+                {
+                    inputParameters.Add(parameter);
+                    sqlBuilder.Append('$').Append(inputParameters.Count);
                 }
             }
-            sb.Append(')');
+
+            sqlBuilder.Append(')');
 
             batchCommand ??= TruncateStatementsToOne();
-            batchCommand.FinalCommandText = sb.ToString();
-            batchCommand.PositionalParameters.AddRange(inputList);
+            batchCommand.FinalCommandText = sqlBuilder.ToString();
+            batchCommand.PositionalParameters.AddRange(inputParameters);
             ValidateParameterCount(batchCommand);
+
             break;
 
         default:
-            throw new InvalidOperationException($"Internal Npgsql bug: unexpected value {CommandType} of enum {nameof(CommandType)}. Please file a bug.");
+            ThrowHelper.ThrowArgumentOutOfRangeException(nameof(CommandType), $"Internal Npgsql bug: unexpected value {{0}} of enum {nameof(CommandType)}. Please file a bug.", commandType);
+            break;
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         static void ValidateParameterCount(NpgsqlBatchCommand batchCommand)
         {
             if (batchCommand.PositionalParameters.Count > ushort.MaxValue)
-                throw new NpgsqlException($"A statement cannot have more than {ushort.MaxValue} parameters");
+                ThrowHelper.ThrowNpgsqlException("A statement cannot have more than 65535 parameters");
         }
     }
 
@@ -960,12 +986,14 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
 
         async Task WriteExecute(NpgsqlConnector connector, bool async, bool flush, CancellationToken cancellationToken)
         {
+            NpgsqlBatchCommand? batchCommand = null;
+
             for (var i = 0; i < InternalBatchCommands.Count; i++)
             {
                 // The following is only for deadlock avoidance when doing sync I/O (so never in multiplexing)
                 ForceAsyncIfNecessary(ref async, i);
 
-                var batchCommand = InternalBatchCommands[i];
+                batchCommand = InternalBatchCommands[i];
                 var pStatement = batchCommand.PreparedStatement;
 
                 Debug.Assert(batchCommand.FinalCommandText is not null);
@@ -999,11 +1027,17 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
 
                 await connector.WriteExecute(0, async, cancellationToken);
 
+                if (batchCommand.AppendErrorBarrier ?? EnableErrorBarriers)
+                    await connector.WriteSync(async, cancellationToken);
+
                 if (pStatement != null)
                     pStatement.LastUsed = DateTime.UtcNow;
             }
 
-            await connector.WriteSync(async, cancellationToken);
+            if (batchCommand is null || !(batchCommand.AppendErrorBarrier ?? EnableErrorBarriers))
+            {
+                await connector.WriteSync(async, cancellationToken);
+            }
 
             if (flush)
                 await connector.Flush(async, cancellationToken);
@@ -1020,9 +1054,8 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
 
                 if (batchCommand.PreparedStatement?.State == PreparedState.Prepared)
                     continue;   // Prepared, we already have the RowDescription
-                Debug.Assert(batchCommand.PreparedStatement == null);
 
-                await connector.WriteParse(batchCommand.FinalCommandText!, string.Empty, batchCommand.PositionalParameters, async, cancellationToken);
+                await connector.WriteParse(batchCommand.FinalCommandText!, batchCommand.StatementName, batchCommand.PositionalParameters, async, cancellationToken);
                 await connector.WriteDescribe(StatementOrPortal.Statement, batchCommand.StatementName, async, cancellationToken);
                 wroteSomething = true;
             }
@@ -1237,7 +1270,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
     /// Executes the <see cref="CommandText"/> against the <see cref="Connection"/>
     /// and returns a <see cref="NpgsqlDataReader"/>.
     /// </summary>
-    /// <param name="behavior">One of the enumeration values that specified the command behavior.</param>
+    /// <param name="behavior">One of the enumeration values that specifies the command behavior.</param>
     /// <returns>A task representing the operation.</returns>
     public new NpgsqlDataReader ExecuteReader(CommandBehavior behavior = CommandBehavior.Default)
         => ExecuteReader(behavior, async: false, CancellationToken.None).GetAwaiter().GetResult();
@@ -1259,7 +1292,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
     /// which executes the <see cref="CommandText"/> against the <see cref="Connection"/>
     /// and returns a <see cref="NpgsqlDataReader"/>.
     /// </summary>
-    /// <param name="behavior">One of the enumeration values that specified the command behavior.</param>
+    /// <param name="behavior">One of the enumeration values that specifies the command behavior.</param>
     /// <param name="cancellationToken">
     /// An optional token to cancel the asynchronous operation. The default value is <see cref="CancellationToken.None"/>.
     /// </param>
@@ -1274,7 +1307,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
     internal ManualResetValueTaskSource<NpgsqlConnector> ExecutionCompletion { get; }
         = new();
 
-    internal async ValueTask<NpgsqlDataReader> ExecuteReader(CommandBehavior behavior, bool async, CancellationToken cancellationToken)
+    internal virtual async ValueTask<NpgsqlDataReader> ExecuteReader(CommandBehavior behavior, bool async, CancellationToken cancellationToken)
     {
         var conn = CheckAndGetConnection();
         _behavior = behavior;
@@ -1284,7 +1317,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
         {
             Debug.Assert(conn is null);
             if (behavior.HasFlag(CommandBehavior.CloseConnection))
-                throw new ArgumentException($"{nameof(CommandBehavior.CloseConnection)} is not supported with ${nameof(NpgsqlConnector)}", nameof(behavior));
+                ThrowHelper.ThrowArgumentException($"{nameof(CommandBehavior.CloseConnection)} is not supported with {nameof(NpgsqlConnector)}", nameof(behavior));
             connector = _connector;
         }
         else
@@ -1297,6 +1330,9 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
         {
             if (connector is not null)
             {
+                var dataSource = connector.DataSource;
+                var logger = connector.CommandLogger;
+
                 cancellationToken.ThrowIfCancellationRequested();
                 // We cannot pass a token here, as we'll cancel a non-send query
                 // Also, we don't pass the cancellation token to StartUserAction, since that would make it scope to the entire action (command execution)
@@ -1305,26 +1341,41 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
 
                 Task? sendTask;
 
+                var validateParameterValues = !behavior.HasFlag(CommandBehavior.SchemaOnly);
+
                 try
                 {
                     switch (IsExplicitlyPrepared)
                     {
                     case true:
                         Debug.Assert(_connectorPreparedOn != null);
-                        if (_connectorPreparedOn != connector)
-                        {
-                            // The command was prepared, but since then the connector has changed. Detach all prepared statements.
-                            foreach (var s in InternalBatchCommands)
-                                s.PreparedStatement = null;
-                            ResetExplicitPreparation();
-                            goto case false;
-                        }
-
                         if (IsWrappedByBatch)
+                        {
                             foreach (var batchCommand in InternalBatchCommands)
-                                batchCommand.Parameters.ProcessParameters(connector.TypeMapper, validate: true);
+                            {
+                                if (batchCommand.ConnectorPreparedOn != connector)
+                                {
+                                    foreach (var s in InternalBatchCommands)
+                                        s.ResetPreparation();
+                                    ResetPreparation();
+                                    goto case false;
+                                }
+                                
+                                batchCommand.Parameters.ProcessParameters(dataSource.TypeMapper, validateParameterValues, CommandType);
+                            }
+                        }
                         else
-                            Parameters.ProcessParameters(connector.TypeMapper, validate: true);
+                        {
+                            if (_connectorPreparedOn != connector)
+                            {
+                                // The command was prepared, but since then the connector has changed. Detach all prepared statements.
+                                foreach (var s in InternalBatchCommands)
+                                    s.PreparedStatement = null;
+                                ResetPreparation();
+                                goto case false;
+                            }
+                            Parameters.ProcessParameters(dataSource.TypeMapper, validateParameterValues, CommandType);
+                        }
 
                         NpgsqlEventSource.Log.CommandStartPrepared();
                         break;
@@ -1338,16 +1389,19 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
                             {
                                 var batchCommand = InternalBatchCommands[i];
 
-                                batchCommand.Parameters.ProcessParameters(connector.TypeMapper, validate: true);
+                                batchCommand.Parameters.ProcessParameters(dataSource.TypeMapper, validateParameterValues, CommandType);
                                 ProcessRawQuery(connector.SqlQueryParser, connector.UseConformingStrings, batchCommand);
 
                                 if (connector.Settings.MaxAutoPrepare > 0 && batchCommand.TryAutoPrepare(connector))
+                                {
+                                    batchCommand.ConnectorPreparedOn = connector;
                                     numPrepared++;
+                                }
                             }
                         }
                         else
                         {
-                            Parameters.ProcessParameters(connector.TypeMapper, validate: true);
+                            Parameters.ProcessParameters(dataSource.TypeMapper, validateParameterValues, CommandType);
                             ProcessRawQuery(connector.SqlQueryParser, connector.UseConformingStrings, batchCommand: null);
 
                             if (connector.Settings.MaxAutoPrepare > 0)
@@ -1368,11 +1422,11 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
 
                     State = CommandState.InProgress;
 
-                    if (Logger.IsEnabled(LogLevel.Information))
+                    if (logger.IsEnabled(LogLevel.Information))
                     {
                         connector.QueryLogStopWatch.Restart();
 
-                        if (Logger.IsEnabled(LogLevel.Debug))
+                        if (logger.IsEnabled(LogLevel.Debug))
                             LogExecutingCompleted(connector, executing: true);
                     }
 
@@ -1380,9 +1434,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
                     TraceCommandStart(connector);
 
                     // If a cancellation is in progress, wait for it to "complete" before proceeding (#615)
-                    lock (connector.CancelLock)
-                    {
-                    }
+                    connector.ResetCancellation();
 
                     // We do not wait for the entire send to complete before proceeding to reading -
                     // the sending continues in parallel with the user's reading. Waiting for the
@@ -1424,28 +1476,28 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
             {
                 Debug.Assert(conn is not null);
                 Debug.Assert(conn.Settings.Multiplexing);
+
                 // The connection isn't bound to a connector - it's multiplexing time.
-                var pool = (MultiplexingConnectorPool)conn.Pool;
+                var dataSource = (MultiplexingDataSource)conn.NpgsqlDataSource;
 
                 if (!async)
                 {
                     // The waiting on the ExecutionCompletion ManualResetValueTaskSource is necessarily
                     // asynchronous, so allowing sync would mean sync-over-async.
-                    throw new NotSupportedException(
-                        "Synchronous command execution is not supported when multiplexing is on");
+                    ThrowHelper.ThrowNotSupportedException("Synchronous command execution is not supported when multiplexing is on");
                 }
 
                 if (IsWrappedByBatch)
                 {
                     foreach (var batchCommand in InternalBatchCommands)
                     {
-                        batchCommand.Parameters.ProcessParameters(pool.MultiplexingTypeMapper!, validate: true);
+                        batchCommand.Parameters.ProcessParameters(dataSource.TypeMapper, validateValues: true, CommandType);
                         ProcessRawQuery(null, standardConformingStrings: true, batchCommand);
                     }
                 }
                 else
                 {
-                    Parameters.ProcessParameters(pool.MultiplexingTypeMapper!, validate: true);
+                    Parameters.ProcessParameters(dataSource.TypeMapper, validateValues: true, CommandType);
                     ProcessRawQuery(null, standardConformingStrings: true, batchCommand: null);
                 }
 
@@ -1455,7 +1507,15 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
                 // Previous behavior was to wait on reading, which throw the exception from ExecuteReader (and not from
                 // the first read). But waiting on writing would allow us to do sync writing and async reading.
                 ExecutionCompletion.Reset();
-                await pool.MultiplexCommandWriter!.WriteAsync(this, cancellationToken);
+                try
+                {
+                    await dataSource.MultiplexCommandWriter.WriteAsync(this, cancellationToken);
+                }
+                catch (ChannelClosedException ex)
+                {
+                    Debug.Assert(ex.InnerException is not null);
+                    throw ex.InnerException;
+                }
                 connector = await new ValueTask<NpgsqlConnector>(ExecutionCompletion, ExecutionCompletion.Version);
                 // TODO: Overload of StartBindingScope?
                 conn.Connector = connector;
@@ -1473,7 +1533,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
         catch (Exception e)
         {
             var reader = connector?.CurrentReader;
-            if (!(e is NpgsqlOperationInProgressException) && reader != null)
+            if (e is not NpgsqlOperationInProgressException && reader is not null)
                 await reader.Cleanup(async);
 
             TraceSetException(e);
@@ -1502,15 +1562,20 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
     /// </summary>
     protected override DbTransaction? DbTransaction
     {
-        get => Transaction;
-        set => Transaction = (NpgsqlTransaction?)value;
+        get => _transaction;
+        set => _transaction = (NpgsqlTransaction?)value;
     }
+
     /// <summary>
     /// This property is ignored by Npgsql. PostgreSQL only supports a single transaction at a given time on
     /// a given connection, and all commands implicitly run inside the current transaction started via
     /// <see cref="NpgsqlConnection.BeginTransaction()"/>
     /// </summary>
-    public new NpgsqlTransaction? Transaction { get; set; }
+    public new NpgsqlTransaction? Transaction
+    {
+        get => (NpgsqlTransaction?)DbTransaction;
+        set => DbTransaction = value;
+    }
 
     #endregion Transactions
 
@@ -1536,41 +1601,46 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
 
     #region Dispose
 
-    /// <summary>
-    /// Releases the resources used by the <see cref="NpgsqlCommand"/>.
-    /// </summary>
+    /// <inheritdoc />
     protected override void Dispose(bool disposing)
     {
-        Transaction = null;
+        ResetTransaction();
 
         State = CommandState.Disposed;
 
-        if (IsCached && _connection is not null && _connection.CachedCommand is null)
+        if (IsCacheable && InternalConnection is not null && InternalConnection.CachedCommand is null)
         {
-            // TODO: Optimize NpgsqlParameterCollection to recycle NpgsqlParameter instances as well
-            // TODO: Statements isn't cleared/recycled, leaving this for now, since it'll be replaced by the new batching API
-
-            _commandText = string.Empty;
-            CommandType = CommandType.Text;
-            _parameters.Clear();
-            _connection.CachedCommand = this;
+            Reset();
+            InternalConnection.CachedCommand = this;
             return;
         }
 
-        IsCached = false;
+        IsCacheable = false;
     }
+
+    internal void Reset()
+    {
+        // TODO: Optimize NpgsqlParameterCollection to recycle NpgsqlParameter instances as well
+        // TODO: Statements isn't cleared/recycled, leaving this for now, since it'll be replaced by the new batching API
+        _commandText = string.Empty;
+        CommandType = CommandType.Text;
+        _parameters.Clear();
+        _timeout = null;
+        _allResultTypesAreUnknown = false;
+        EnableErrorBarriers = false;
+    }
+
+    internal void ResetTransaction() => _transaction = null;
 
     #endregion
 
     #region Tracing
 
-    #endregion Tracing
-
     internal void TraceCommandStart(NpgsqlConnector connector)
     {
         Debug.Assert(CurrentActivity is null);
         if (NpgsqlActivitySource.IsEnabled)
-            CurrentActivity = NpgsqlActivitySource.CommandStart(connector, CommandText);
+            CurrentActivity = NpgsqlActivitySource.CommandStart(connector, CommandText, CommandType);
     }
 
     internal void TraceReceivedFirstResponse()
@@ -1598,6 +1668,8 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
             CurrentActivity = null;
         }
     }
+
+    #endregion Tracing
 
     #region Misc
 
@@ -1647,7 +1719,8 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
 
     internal void LogExecutingCompleted(NpgsqlConnector connector, bool executing)
     {
-        var logParameters = NpgsqlLoggingConfiguration.IsParameterLoggingEnabled || connector.Settings.LogParameters;
+        var logParameters = connector.LoggingConfiguration.IsParameterLoggingEnabled || connector.Settings.LogParameters;
+        var logger = connector.LoggingConfiguration.CommandLogger;
 
         if (InternalBatchCommands.Count == 1)
         {
@@ -1658,7 +1731,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
                 if (executing)
                 {
                     LogMessages.ExecutingCommandWithParameters(
-                        Logger,
+                        logger,
                         singleCommand.FinalCommandText!,
                         singleCommand.PositionalParameters.Select(p => p.Value == DBNull.Value ? "NULL" : p.Value!).ToArray(),
                         connector.Id);
@@ -1666,7 +1739,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
                 else
                 {
                     LogMessages.CommandExecutionCompletedWithParameters(
-                        Logger,
+                        logger,
                         singleCommand.FinalCommandText!,
                         singleCommand.PositionalParameters.Select(p => p.Value == DBNull.Value ? "NULL" : p.Value!).ToArray(),
                         connector.QueryLogStopWatch.ElapsedMilliseconds,
@@ -1676,9 +1749,9 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
             else
             {
                 if (executing)
-                    LogMessages.ExecutingCommand(Logger, singleCommand.FinalCommandText!, connector.Id);
+                    LogMessages.ExecutingCommand(logger, singleCommand.FinalCommandText!, connector.Id);
                 else
-                    LogMessages.CommandExecutionCompleted(Logger, singleCommand.FinalCommandText!, connector.QueryLogStopWatch.ElapsedMilliseconds, connector.Id);
+                    LogMessages.CommandExecutionCompleted(logger, singleCommand.FinalCommandText!, connector.QueryLogStopWatch.ElapsedMilliseconds, connector.Id);
             }
         }
         else
@@ -1692,18 +1765,18 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
                     ).ToArray();
 
                 if (executing)
-                    LogMessages.ExecutingBatchWithParameters(Logger, commands, connector.Id);
+                    LogMessages.ExecutingBatchWithParameters(logger, commands, connector.Id);
                 else
-                    LogMessages.BatchExecutionCompletedWithParameters(Logger, commands, connector.QueryLogStopWatch.ElapsedMilliseconds, connector.Id);
+                    LogMessages.BatchExecutionCompletedWithParameters(logger, commands, connector.QueryLogStopWatch.ElapsedMilliseconds, connector.Id);
             }
             else
             {
                 var commands = InternalBatchCommands.Select(c => c.CommandText).ToArray().ToArray();
 
                 if (executing)
-                    LogMessages.ExecutingBatch(Logger, commands, connector.Id);
+                    LogMessages.ExecutingBatch(logger, commands, connector.Id);
                 else
-                    LogMessages.BatchExecutionCompleted(Logger, commands, connector.QueryLogStopWatch.ElapsedMilliseconds, connector.Id);
+                    LogMessages.BatchExecutionCompleted(logger, commands, connector.QueryLogStopWatch.ElapsedMilliseconds, connector.Id);
             }
         }
     }
@@ -1718,9 +1791,9 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
     /// Create a new command based on this one.
     /// </summary>
     /// <returns>A new NpgsqlCommand object.</returns>
-    public NpgsqlCommand Clone()
+    public virtual NpgsqlCommand Clone()
     {
-        var clone = new NpgsqlCommand(CommandText, _connection, Transaction)
+        var clone = new NpgsqlCommand(CommandText, InternalConnection, Transaction)
         {
             CommandTimeout = CommandTimeout, CommandType = CommandType, DesignTimeVisible = DesignTimeVisible, _allResultTypesAreUnknown = _allResultTypesAreUnknown, _unknownResultTypeList = _unknownResultTypeList, ObjectResultTypes = ObjectResultTypes
         };
@@ -1728,26 +1801,26 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
         return clone;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     NpgsqlConnection? CheckAndGetConnection()
     {
         if (State == CommandState.Disposed)
-            throw new ObjectDisposedException(GetType().FullName);
-        if (_connection == null)
+            ThrowHelper.ThrowObjectDisposedException(GetType().FullName);
+        if (InternalConnection == null)
         {
             if (_connector is null)
-                throw new InvalidOperationException("Connection property has not been initialized.");
+                ThrowHelper.ThrowInvalidOperationException("Connection property has not been initialized.");
             return null;
         }
-        switch (_connection.FullState)
+        switch (InternalConnection.FullState)
         {
         case ConnectionState.Open:
         case ConnectionState.Connecting:
         case ConnectionState.Open | ConnectionState.Executing:
         case ConnectionState.Open | ConnectionState.Fetching:
-            return _connection;
+            return InternalConnection;
         default:
-            throw new InvalidOperationException("Connection is not open");
+            ThrowHelper.ThrowInvalidOperationException("Connection is not open");
+            return null;
         }
     }
 

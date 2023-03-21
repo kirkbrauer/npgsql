@@ -12,7 +12,7 @@ abstract class AuthenticationRequestMessage : IBackendMessage
     internal abstract AuthenticationRequestType AuthRequestType { get; }
 }
 
-class AuthenticationOkMessage : AuthenticationRequestMessage
+sealed class AuthenticationOkMessage : AuthenticationRequestMessage
 {
     internal override AuthenticationRequestType AuthRequestType => AuthenticationRequestType.AuthenticationOk;
 
@@ -20,7 +20,7 @@ class AuthenticationOkMessage : AuthenticationRequestMessage
     AuthenticationOkMessage() { }
 }
 
-class AuthenticationKerberosV5Message : AuthenticationRequestMessage
+sealed class AuthenticationKerberosV5Message : AuthenticationRequestMessage
 {
     internal override AuthenticationRequestType AuthRequestType => AuthenticationRequestType.AuthenticationKerberosV5;
 
@@ -28,7 +28,7 @@ class AuthenticationKerberosV5Message : AuthenticationRequestMessage
     AuthenticationKerberosV5Message() { }
 }
 
-class AuthenticationCleartextPasswordMessage  : AuthenticationRequestMessage
+sealed class AuthenticationCleartextPasswordMessage  : AuthenticationRequestMessage
 {
     internal override AuthenticationRequestType AuthRequestType => AuthenticationRequestType.AuthenticationCleartextPassword;
 
@@ -36,11 +36,11 @@ class AuthenticationCleartextPasswordMessage  : AuthenticationRequestMessage
     AuthenticationCleartextPasswordMessage() { }
 }
 
-class AuthenticationMD5PasswordMessage  : AuthenticationRequestMessage
+sealed class AuthenticationMD5PasswordMessage  : AuthenticationRequestMessage
 {
     internal override AuthenticationRequestType AuthRequestType => AuthenticationRequestType.AuthenticationMD5Password;
 
-    internal byte[] Salt { get; private set; }
+    internal byte[] Salt { get; }
 
     internal static AuthenticationMD5PasswordMessage Load(NpgsqlReadBuffer buf)
     {
@@ -55,7 +55,7 @@ class AuthenticationMD5PasswordMessage  : AuthenticationRequestMessage
     }
 }
 
-class AuthenticationSCMCredentialMessage : AuthenticationRequestMessage
+sealed class AuthenticationSCMCredentialMessage : AuthenticationRequestMessage
 {
     internal override AuthenticationRequestType AuthRequestType => AuthenticationRequestType.AuthenticationSCMCredential;
 
@@ -63,7 +63,7 @@ class AuthenticationSCMCredentialMessage : AuthenticationRequestMessage
     AuthenticationSCMCredentialMessage() { }
 }
 
-class AuthenticationGSSMessage : AuthenticationRequestMessage
+sealed class AuthenticationGSSMessage : AuthenticationRequestMessage
 {
     internal override AuthenticationRequestType AuthRequestType => AuthenticationRequestType.AuthenticationGSS;
 
@@ -71,11 +71,11 @@ class AuthenticationGSSMessage : AuthenticationRequestMessage
     AuthenticationGSSMessage() { }
 }
 
-class AuthenticationGSSContinueMessage : AuthenticationRequestMessage
+sealed class AuthenticationGSSContinueMessage : AuthenticationRequestMessage
 {
     internal override AuthenticationRequestType AuthRequestType => AuthenticationRequestType.AuthenticationGSSContinue;
 
-    internal byte[] AuthenticationData { get; private set; }
+    internal byte[] AuthenticationData { get; }
 
     internal static AuthenticationGSSContinueMessage Load(NpgsqlReadBuffer buf, int len)
     {
@@ -91,7 +91,7 @@ class AuthenticationGSSContinueMessage : AuthenticationRequestMessage
     }
 }
 
-class AuthenticationSSPIMessage : AuthenticationRequestMessage
+sealed class AuthenticationSSPIMessage : AuthenticationRequestMessage
 {
     internal override AuthenticationRequestType AuthRequestType => AuthenticationRequestType.AuthenticationSSPI;
 
@@ -101,7 +101,7 @@ class AuthenticationSSPIMessage : AuthenticationRequestMessage
 
 #region SASL
 
-class AuthenticationSASLMessage : AuthenticationRequestMessage
+sealed class AuthenticationSASLMessage : AuthenticationRequestMessage
 {
     internal override AuthenticationRequestType AuthRequestType => AuthenticationRequestType.AuthenticationSASL;
     internal List<string> Mechanisms { get; } = new();
@@ -116,7 +116,7 @@ class AuthenticationSASLMessage : AuthenticationRequestMessage
     }
 }
 
-class AuthenticationSASLContinueMessage : AuthenticationRequestMessage
+sealed class AuthenticationSASLContinueMessage : AuthenticationRequestMessage
 {
     internal override AuthenticationRequestType AuthRequestType => AuthenticationRequestType.AuthenticationSASLContinue;
     internal byte[] Payload { get; }
@@ -128,15 +128,13 @@ class AuthenticationSASLContinueMessage : AuthenticationRequestMessage
     }
 }
 
-class AuthenticationSCRAMServerFirstMessage
+sealed class AuthenticationSCRAMServerFirstMessage
 {
-    static readonly ILogger Logger = NpgsqlLoggingConfiguration.ConnectionLogger;
-
     internal string Nonce { get; }
     internal string Salt { get; }
     internal int Iteration { get; }
 
-    internal static AuthenticationSCRAMServerFirstMessage Load(byte[] bytes)
+    internal static AuthenticationSCRAMServerFirstMessage Load(byte[] bytes, ILogger connectionLogger)
     {
         var data = PGUtil.UTF8Encoding.GetString(bytes);
         string? nonce = null, salt = null;
@@ -151,7 +149,7 @@ class AuthenticationSCRAMServerFirstMessage
             else if (part.StartsWith("i=", StringComparison.Ordinal))
                 iteration = int.Parse(part.Substring(2));
             else
-                Logger.LogDebug("Unknown part in SCRAM server-first message:" + part);
+                connectionLogger.LogDebug("Unknown part in SCRAM server-first message:" + part);
         }
 
         if (nonce == null)
@@ -172,7 +170,7 @@ class AuthenticationSCRAMServerFirstMessage
     }
 }
 
-class AuthenticationSASLFinalMessage : AuthenticationRequestMessage
+sealed class AuthenticationSASLFinalMessage : AuthenticationRequestMessage
 {
     internal override AuthenticationRequestType AuthRequestType => AuthenticationRequestType.AuthenticationSASLFinal;
     internal byte[] Payload { get; }
@@ -184,13 +182,11 @@ class AuthenticationSASLFinalMessage : AuthenticationRequestMessage
     }
 }
 
-class AuthenticationSCRAMServerFinalMessage
+sealed class AuthenticationSCRAMServerFinalMessage
 {
-    static readonly ILogger Logger = NpgsqlLoggingConfiguration.ConnectionLogger;
-
     internal string ServerSignature { get; }
 
-    internal static AuthenticationSCRAMServerFinalMessage Load(byte[] bytes)
+    internal static AuthenticationSCRAMServerFinalMessage Load(byte[] bytes, ILogger connectionLogger)
     {
         var data = PGUtil.UTF8Encoding.GetString(bytes);
         string? serverSignature = null;
@@ -200,7 +196,7 @@ class AuthenticationSCRAMServerFinalMessage
             if (part.StartsWith("v=", StringComparison.Ordinal))
                 serverSignature = part.Substring(2);
             else
-                Logger.LogDebug("Unknown part in SCRAM server-first message:" + part);
+                connectionLogger.LogDebug("Unknown part in SCRAM server-first message:" + part);
         }
 
         if (serverSignature == null)

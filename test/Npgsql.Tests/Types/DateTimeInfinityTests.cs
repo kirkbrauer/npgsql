@@ -9,8 +9,8 @@ namespace Npgsql.Tests.Types;
 [TestFixture(true)]
 #if DEBUG
 [TestFixture(false)]
-#endif
 [NonParallelizable]
+#endif
 public class DateTimeInfinityTests : TestBase, IDisposable
 {
     [Test]
@@ -199,11 +199,11 @@ public class DateTimeInfinityTests : TestBase, IDisposable
 #if DEBUG
         DisableDateTimeInfinityConversions = disableDateTimeInfinityConversions;
 #else
-            if (disableDateTimeInfinityConversions)
-            {
-                Assert.Ignore(
-                    "DateTimeInfinityTests rely on the Npgsql.DisableDateTimeInfinityConversions AppContext switch and can only be run in DEBUG builds");
-            }
+        if (disableDateTimeInfinityConversions)
+        {
+            Assert.Ignore(
+                "DateTimeInfinityTests rely on the Npgsql.DisableDateTimeInfinityConversions AppContext switch and can only be run in DEBUG builds");
+        }
 #endif
     }
 

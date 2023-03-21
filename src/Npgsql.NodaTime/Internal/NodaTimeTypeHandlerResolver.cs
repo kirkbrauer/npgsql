@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using NodaTime;
 using Npgsql.Internal;
 using Npgsql.Internal.TypeHandlers;
@@ -74,9 +73,21 @@ public class NodaTimeTypeHandlerResolver : TypeHandlerResolver
         };
 
     public override NpgsqlTypeHandler? ResolveByClrType(Type type)
-        => ClrTypeToDataTypeName(type) is { } dataTypeName && ResolveByDataTypeName(dataTypeName) is { } handler
+        => NodaTimeTypeMappingResolver.ClrTypeToDataTypeName(type) is { } dataTypeName && ResolveByDataTypeName(dataTypeName) is { } handler
             ? handler
             : null;
+
+    public override NpgsqlTypeHandler? ResolveByNpgsqlDbType(NpgsqlDbType npgsqlDbType)
+        => npgsqlDbType switch
+        {
+            NpgsqlDbType.TimestampTzRange => TsTzRange(),
+            NpgsqlDbType.DateRange => DateRange(),
+            NpgsqlDbType.TimestampTzMultirange => TsTzMultirange(),
+            NpgsqlDbType.DateMultirange => DateMultirange(),
+            NpgsqlDbType.TimestampTzRange | NpgsqlDbType.Array => TsTzRangeArray(),
+            NpgsqlDbType.DateRange | NpgsqlDbType.Array => TsTzRangeArray(),
+            _ => null
+        };
 
     public override NpgsqlTypeHandler? ResolveValueTypeGenerically<T>(T value)
     {
@@ -119,90 +130,6 @@ public class NodaTimeTypeHandlerResolver : TypeHandlerResolver
         return null;
     }
 
-    internal static string? ClrTypeToDataTypeName(Type type)
-    {
-        if (type == typeof(Instant))
-            return LegacyTimestampBehavior ? "timestamp without time zone" : "timestamp with time zone";
-
-        if (type == typeof(LocalDateTime))
-            return "timestamp without time zone";
-        if (type == typeof(ZonedDateTime) || type == typeof(OffsetDateTime))
-            return "timestamp with time zone";
-        if (type == typeof(LocalDate))
-            return "date";
-        if (type == typeof(LocalTime))
-            return "time without time zone";
-        if (type == typeof(OffsetTime))
-            return "time with time zone";
-        if (type == typeof(Period) || type == typeof(Duration))
-            return "interval";
-
-        // Ranges
-        if (type == typeof(NpgsqlRange<LocalDateTime>))
-            return "tsrange";
-
-        if (type == typeof(Interval) ||
-            type == typeof(NpgsqlRange<Instant>) ||
-            type == typeof(NpgsqlRange<ZonedDateTime>) ||
-            type == typeof(NpgsqlRange<OffsetDateTime>))
-        {
-            return "tstzrange";
-        }
-
-        if (type == typeof(DateInterval) || type == typeof(NpgsqlRange<LocalDate>))
-            return "daterange";
-
-        // Multiranges
-        if (type == typeof(NpgsqlRange<LocalDateTime>[]) || type == typeof(List<NpgsqlRange<LocalDateTime>>))
-            return "tsmultirange";
-
-        if (type == typeof(Interval[]) ||
-            type == typeof(List<Interval>) ||
-            type == typeof(NpgsqlRange<Instant>[]) ||
-            type == typeof(List<NpgsqlRange<Instant>>) ||
-            type == typeof(NpgsqlRange<ZonedDateTime>[]) ||
-            type == typeof(List<NpgsqlRange<ZonedDateTime>>) ||
-            type == typeof(NpgsqlRange<OffsetDateTime>[]) ||
-            type == typeof(List<NpgsqlRange<OffsetDateTime>>))
-        {
-            return "tstzmultirange";
-        }
-        if (type == typeof(DateInterval[]) ||
-            type == typeof(List<DateInterval>) ||
-            type == typeof(NpgsqlRange<LocalDate>[]) ||
-            type == typeof(List<NpgsqlRange<LocalDate>>))
-        {
-            return "datemultirange";
-        }
-
-        return null;
-    }
-
-    public override TypeMappingInfo? GetMappingByDataTypeName(string dataTypeName)
-        => DoGetMappingByDataTypeName(dataTypeName);
-
-    internal static TypeMappingInfo? DoGetMappingByDataTypeName(string dataTypeName)
-        => dataTypeName switch
-        {
-            "timestamp" or "timestamp without time zone" => new(NpgsqlDbType.Timestamp,             "timestamp without time zone"),
-            "timestamptz" or "timestamp with time zone"  => new(NpgsqlDbType.TimestampTz,           "timestamp with time zone"),
-            "date"                                       => new(NpgsqlDbType.Date,                  "date"),
-            "time without time zone"                     => new(NpgsqlDbType.Time,                  "time without time zone"),
-            "time with time zone"                        => new(NpgsqlDbType.TimeTz,                "time with time zone"),
-            "interval"                                   => new(NpgsqlDbType.Interval,              "interval"),
-
-            "tsrange"                                    => new(NpgsqlDbType.TimestampRange,        "tsrange"),
-            "tstzrange"                                  => new(NpgsqlDbType.TimestampTzRange,      "tstzrange"),
-            "daterange"                                  => new(NpgsqlDbType.DateRange,             "daterange"),
-
-            "tsmultirange"                               => new(NpgsqlDbType.TimestampMultirange,   "tsmultirange"),
-            "tstzmultirange"                             => new(NpgsqlDbType.TimestampTzMultirange, "tstzmultirange"),
-            "datemultirange"                             => new(NpgsqlDbType.DateMultirange,        "datemultirange"),
-
-            _ => null
-        };
-
-
     PostgresType PgType(string pgTypeName) => _databaseInfo.GetPostgresTypeByName(pgTypeName);
 
     TimestampTzRangeHandler TsTzRange()
@@ -220,9 +147,9 @@ public class NodaTimeTypeHandlerResolver : TypeHandlerResolver
 
     NpgsqlTypeHandler TsTzRangeArray()
         => _timestampTzRangeArray ??=
-            new ArrayHandler<Interval>((PostgresArrayType)PgType("tstzrange[]"), TsTzRange(), _arrayNullabilityMode);
+            new ArrayHandler((PostgresArrayType)PgType("tstzrange[]"), TsTzRange(), _arrayNullabilityMode);
 
     NpgsqlTypeHandler DateRangeArray()
         => _dateRangeArray ??=
-            new ArrayHandler<DateInterval>((PostgresArrayType)PgType("daterange[]"), DateRange(), _arrayNullabilityMode);
+            new ArrayHandler((PostgresArrayType)PgType("daterange[]"), DateRange(), _arrayNullabilityMode);
 }

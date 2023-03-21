@@ -27,9 +27,9 @@ public sealed partial class NpgsqlConnectionStringBuilder : DbConnectionStringBu
     /// </summary>
     string? _dataSourceCached;
 
-    internal string DataSourceCached
-        => _dataSourceCached ??= _host is null
-            ? string.Empty
+    internal string? DataSourceCached
+        => _dataSourceCached ??= _host is null || _host.Contains(',')
+            ? null
             : IsUnixSocket(_host, _port, out var socketPath, replaceForAbstract: false)
                 ? socketPath
                 : $"tcp://{_host}:{_port}";
@@ -262,7 +262,7 @@ public sealed partial class NpgsqlConnectionStringBuilder : DbConnectionStringBu
     string? _database;
 
     /// <summary>
-    /// The username to connect with. Not required if using IntegratedSecurity.
+    /// The username to connect with. Not required if using GSS/SSPI/Kerberos.
     /// </summary>
     [Category("Connection")]
     [Description("The username to connect with. Not required if using IntegratedSecurity.")]
@@ -280,7 +280,7 @@ public sealed partial class NpgsqlConnectionStringBuilder : DbConnectionStringBu
     string? _username;
 
     /// <summary>
-    /// The password to connect with. Not required if using IntegratedSecurity.
+    /// The password to connect with. Not required if using GSS/SSPI/Kerberos.
     /// </summary>
     [Category("Connection")]
     [Description("The password to connect with. Not required if using IntegratedSecurity.")]
@@ -558,28 +558,6 @@ public sealed partial class NpgsqlConnectionStringBuilder : DbConnectionStringBu
         }
     }
     bool _checkCertificateRevocation;
-
-    /// <summary>
-    /// Whether to use Windows integrated security to log in.
-    /// </summary>
-    [Category("Security")]
-    [Description("Whether to use Windows integrated security to log in.")]
-    [DisplayName("Integrated Security")]
-    [NpgsqlConnectionStringProperty]
-    public bool IntegratedSecurity
-    {
-        get => _integratedSecurity;
-        set
-        {
-            // No integrated security if we're on mono and .NET 4.5 because of ClaimsIdentity,
-            // see https://github.com/npgsql/Npgsql/issues/133
-            if (value && Type.GetType("Mono.Runtime") != null)
-                throw new NotSupportedException("IntegratedSecurity is currently unsupported on mono and .NET 4.5 (see https://github.com/npgsql/Npgsql/issues/133)");
-            _integratedSecurity = value;
-            SetValue(nameof(IntegratedSecurity), value);
-        }
-    }
-    bool _integratedSecurity;
 
     /// <summary>
     /// The Kerberos service name to be used for authentication.
@@ -938,7 +916,7 @@ public sealed partial class NpgsqlConnectionStringBuilder : DbConnectionStringBu
         }
     }
 
-    internal TargetSessionAttributes? TargetSessionAttributesParsed { get; private set; }
+    internal TargetSessionAttributes? TargetSessionAttributesParsed { get; set; }
 
     internal static TargetSessionAttributes ParseTargetSessionAttributes(string s)
         => s switch
@@ -1417,6 +1395,25 @@ public sealed partial class NpgsqlConnectionStringBuilder : DbConnectionStringBu
     #region Properties - Obsolete
 
     /// <summary>
+    /// Whether to use Windows integrated security to log in.
+    /// </summary>
+    [Category("Security")]
+    [Description("Whether to use Windows integrated security to log in.")]
+    [DisplayName("Integrated Security")]
+    [NpgsqlConnectionStringProperty]
+    [Obsolete("The IntegratedSecurity parameter is no longer needed and does nothing.")]
+    public bool IntegratedSecurity
+    {
+        get => _integratedSecurity;
+        set
+        {
+            _integratedSecurity = value;
+            SetValue(nameof(IntegratedSecurity), value);
+        }
+    }
+    bool _integratedSecurity;
+
+    /// <summary>
     /// Obsolete, see https://www.npgsql.org/doc/release-notes/6.0.html
     /// </summary>
     [Category("Compatibility")]
@@ -1561,7 +1558,7 @@ public sealed partial class NpgsqlConnectionStringBuilder : DbConnectionStringBu
 
     #region Misc
 
-    internal void Validate()
+    internal void PostProcessAndValidate()
     {
         if (string.IsNullOrWhiteSpace(Host))
             throw new ArgumentException("Host can't be null");
@@ -1569,6 +1566,23 @@ public sealed partial class NpgsqlConnectionStringBuilder : DbConnectionStringBu
             throw new ArgumentException("Pooling must be on to use multiplexing");
         if (TrustServerCertificate && SslMode is SslMode.Allow or SslMode.VerifyCA or SslMode.VerifyFull)
             throw new ArgumentException(NpgsqlStrings.CannotUseTrustServerCertificate);
+
+        if (!Host.Contains(','))
+        {
+            if (TargetSessionAttributesParsed is not null &&
+                TargetSessionAttributesParsed != Npgsql.TargetSessionAttributes.Any)
+            {
+                throw new NotSupportedException("Target Session Attributes other then Any is only supported with multiple hosts");
+            }
+
+            // Support single host:port format in Host
+            if (!IsUnixSocket(Host, Port, out _) &&
+                TrySplitHostPort(Host.AsSpan(), out var newHost, out var newPort))
+            {
+                Host = newHost;
+                Port = newPort;
+            }
+        }
     }
 
     internal string ToStringWithoutPassword()
@@ -1691,6 +1705,7 @@ public sealed partial class NpgsqlConnectionStringBuilder : DbConnectionStringBu
     #region ICustomTypeDescriptor
 
     /// <inheritdoc />
+    [RequiresUnreferencedCode("PropertyDescriptor's PropertyType cannot be statically discovered.")]
     protected override void GetProperties(Hashtable propertyDescriptors)
     {
         // Tweak which properties are exposed via TypeDescriptor. This affects the VS DDEX
@@ -1709,8 +1724,6 @@ public sealed partial class NpgsqlConnectionStringBuilder : DbConnectionStringBu
     }
 
     #endregion
-
-    internal static readonly string[] EmptyStringArray = new string[0];
 }
 
 #region Attributes
@@ -1720,7 +1733,7 @@ public sealed partial class NpgsqlConnectionStringBuilder : DbConnectionStringBu
 /// string. Optionally holds a set of synonyms for the property.
 /// </summary>
 [AttributeUsage(AttributeTargets.Property)]
-public class NpgsqlConnectionStringPropertyAttribute : Attribute
+sealed class NpgsqlConnectionStringPropertyAttribute : Attribute
 {
     /// <summary>
     /// Holds a list of synonyms for the property.
@@ -1731,17 +1744,13 @@ public class NpgsqlConnectionStringPropertyAttribute : Attribute
     /// Creates a <see cref="NpgsqlConnectionStringPropertyAttribute"/>.
     /// </summary>
     public NpgsqlConnectionStringPropertyAttribute()
-    {
-        Synonyms = NpgsqlConnectionStringBuilder.EmptyStringArray;
-    }
+        => Synonyms = Array.Empty<string>();
 
     /// <summary>
     /// Creates a <see cref="NpgsqlConnectionStringPropertyAttribute"/>.
     /// </summary>
     public NpgsqlConnectionStringPropertyAttribute(params string[] synonyms)
-    {
-        Synonyms = synonyms;
-    }
+        => Synonyms = synonyms;
 }
 
 #endregion
@@ -1852,48 +1861,6 @@ enum ReplicationMode
     /// Logical replication enabled
     /// </summary>
     Logical
-}
-
-/// <summary>
-/// Specifies server type preference.
-/// </summary>
-enum TargetSessionAttributes : byte
-{
-    /// <summary>
-    /// Any successful connection is acceptable.
-    /// </summary>
-    Any = 0,
-
-    /// <summary>
-    /// Session must accept read-write transactions by default (that is, the server must not be in hot standby mode and the
-    /// <c>default_transaction_read_only</c> parameter must be off).
-    /// </summary>
-    ReadWrite = 1,
-
-    /// <summary>
-    /// Session must not accept read-write transactions by default (the converse).
-    /// </summary>
-    ReadOnly = 2,
-
-    /// <summary>
-    /// Server must not be in hot standby mode.
-    /// </summary>
-    Primary = 3,
-
-    /// <summary>
-    /// Server must be in hot standby mode.
-    /// </summary>
-    Standby = 4,
-
-    /// <summary>
-    /// First try to find a primary server, but if none of the listed hosts is a primary server, try again in <see cref="Any"/> mode.
-    /// </summary>
-    PreferPrimary = 5,
-
-    /// <summary>
-    /// First try to find a standby server, but if none of the listed hosts is a standby server, try again in <see cref="Any"/> mode.
-    /// </summary>
-    PreferStandby = 6,
 }
 
 #endregion

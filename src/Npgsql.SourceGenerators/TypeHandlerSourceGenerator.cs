@@ -11,7 +11,7 @@ using Scriban;
 namespace Npgsql.SourceGenerators;
 
 [Generator]
-class TypeHandlerSourceGenerator : ISourceGenerator
+sealed class TypeHandlerSourceGenerator : ISourceGenerator
 {
     public void Initialize(GeneratorInitializationContext context)
         => context.RegisterForSyntaxNotifications(() => new MySyntaxReceiver());
@@ -68,8 +68,10 @@ class TypeHandlerSourceGenerator : ISourceGenerator
 
             var interfaces = typeSymbol.AllInterfaces
                 .Where(i => i.OriginalDefinition.Equals(isSimple ? simpleTypeHandlerInterfaceSymbol : typeHandlerInterfaceSymbol,
-                                SymbolEqualityComparer.Default) &&
-                            !i.TypeArguments[0].IsAbstract);
+                    SymbolEqualityComparer.Default))
+                // Hacky: we want to emit switch arms for abstract types after concrete ones, since otherwise the compiled complains about
+                // unreachable arms
+                .OrderBy(i => i.TypeArguments[0].IsAbstract);
 
             var output = template.Render(new
             {
@@ -110,7 +112,7 @@ class TypeHandlerSourceGenerator : ISourceGenerator
         }
     }
 
-    class MySyntaxReceiver : ISyntaxReceiver
+    sealed class MySyntaxReceiver : ISyntaxReceiver
     {
         public List<ClassDeclarationSyntax> TypeHandlerCandidates { get; } = new();
 

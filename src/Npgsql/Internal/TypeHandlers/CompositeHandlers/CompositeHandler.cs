@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Npgsql.BackendMessages;
 using Npgsql.Internal.TypeHandling;
+using Npgsql.Internal.TypeMapping;
 using Npgsql.PostgresTypes;
 using Npgsql.TypeMapping;
 using NpgsqlTypes;
@@ -40,9 +41,9 @@ using NpgsqlTypes;
 
 namespace Npgsql.Internal.TypeHandlers.CompositeHandlers;
 
-partial class CompositeHandler<T> : NpgsqlTypeHandler<T>, ICompositeHandler
+sealed partial class CompositeHandler<T> : NpgsqlTypeHandler<T>, ICompositeHandler
 {
-    readonly ConnectorTypeMapper _typeMapper;
+    readonly TypeMapper _typeMapper;
     readonly INpgsqlNameTranslator _nameTranslator;
 
     Func<T>? _constructor;
@@ -51,7 +52,7 @@ partial class CompositeHandler<T> : NpgsqlTypeHandler<T>, ICompositeHandler
 
     public Type CompositeType => typeof(T);
 
-    public CompositeHandler(PostgresCompositeType postgresType, ConnectorTypeMapper typeMapper, INpgsqlNameTranslator nameTranslator)
+    public CompositeHandler(PostgresCompositeType postgresType, TypeMapper typeMapper, INpgsqlNameTranslator nameTranslator)
         : base(postgresType)
     {
         _typeMapper = typeMapper;
@@ -146,7 +147,7 @@ partial class CompositeHandler<T> : NpgsqlTypeHandler<T>, ICompositeHandler
         }
     }
 
-    static CompositeConstructorHandler<T>? CreateConstructorHandler(PostgresCompositeType pgType, ConnectorTypeMapper typeMapper, INpgsqlNameTranslator nameTranslator)
+    static CompositeConstructorHandler<T>? CreateConstructorHandler(PostgresCompositeType pgType, TypeMapper typeMapper, INpgsqlNameTranslator nameTranslator)
     {
         var pgFields = pgType.Fields;
         var clrType = typeof(T);
@@ -222,7 +223,7 @@ partial class CompositeHandler<T> : NpgsqlTypeHandler<T>, ICompositeHandler
         return null;
     }
 
-    static CompositeMemberHandler<T>[] CreateMemberHandlers(PostgresCompositeType pgType, ConnectorTypeMapper typeMapper, INpgsqlNameTranslator nameTranslator)
+    static CompositeMemberHandler<T>[] CreateMemberHandlers(PostgresCompositeType pgType, TypeMapper typeMapper, INpgsqlNameTranslator nameTranslator)
     {
         var pgFields = pgType.Fields;
 

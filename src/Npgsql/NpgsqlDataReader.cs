@@ -9,6 +9,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -141,18 +142,22 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
 
     internal NpgsqlNestedDataReader? CachedFreeNestedDataReader;
 
-    static readonly ILogger Logger = NpgsqlLoggingConfiguration.CommandLogger;
+    readonly ILogger _commandLogger;
 
     internal NpgsqlDataReader(NpgsqlConnector connector)
     {
         Connector = connector;
+        _commandLogger = connector.CommandLogger;
     }
 
     internal void Init(
-        NpgsqlCommand command, CommandBehavior behavior, List<NpgsqlBatchCommand> statements, Task? sendTask = null)
+        NpgsqlCommand command,
+        CommandBehavior behavior,
+        List<NpgsqlBatchCommand> statements,
+        Task? sendTask = null)
     {
         Command = command;
-        _connection = command.Connection;
+        _connection = command.InternalConnection;
         _behavior = behavior;
         _isSchemaOnly = _behavior.HasFlag(CommandBehavior.SchemaOnly);
         _isSequential = _behavior.HasFlag(CommandBehavior.SequentialAccess);
@@ -241,7 +246,7 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
             return null;
         }
 
-        var msg = Connector.ParseServerMessage(readBuf, messageCode, len, false)!;
+        var msg = Connector.ParseServerMessage(readBuf, BackendMessageCode.DataRow, len, false)!;
         Debug.Assert(msg.Code == BackendMessageCode.DataRow);
         ProcessMessage(msg);
         return true;
@@ -276,12 +281,28 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
             case ReaderState.Disposed:
                 return false;
             default:
-                throw new ArgumentOutOfRangeException();
+                ThrowHelper.ThrowArgumentOutOfRangeException();
+                return false;
             }
 
-            var msg2 = await ReadMessage(async);
-            ProcessMessage(msg2);
-            return msg2.Code == BackendMessageCode.DataRow;
+            var msg = await ReadMessage(async);
+
+            switch (msg.Code)
+            {
+            case BackendMessageCode.DataRow:
+                ProcessMessage(msg);
+                return true;
+
+            case BackendMessageCode.CommandComplete:
+            case BackendMessageCode.EmptyQueryResponse:
+                ProcessMessage(msg);
+                if (_statements[StatementIndex].AppendErrorBarrier ?? Command.EnableErrorBarriers)
+                    Expect<ReadyForQueryMessage>(await Connector.ReadMessage(async), Connector);
+                return false;
+
+            default:
+                throw Connector.UnexpectedMessageReceived(msg.Code);
+            }
         }
         catch
         {
@@ -331,10 +352,11 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
     /// <returns>A task representing the asynchronous operation.</returns>
     public override Task<bool> NextResultAsync(CancellationToken cancellationToken)
     {
-        using (NoSynchronizationContextScope.Enter())
-            return _isSchemaOnly
-                ? NextResultSchemaOnly(async: true, cancellationToken: cancellationToken)
-                : NextResult(async: true, cancellationToken: cancellationToken);
+        using var _ = NoSynchronizationContextScope.Enter();
+
+        return _isSchemaOnly
+            ? NextResultSchemaOnly(async: true, cancellationToken: cancellationToken)
+            : NextResult(async: true, cancellationToken: cancellationToken);
     }
 
     /// <summary>
@@ -366,7 +388,12 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
                     case BackendMessageCode.CommandComplete:
                     case BackendMessageCode.EmptyQueryResponse:
                         ProcessMessage(completedMsg);
+
+                        if (_statements[StatementIndex].AppendErrorBarrier ?? Command.EnableErrorBarriers)
+                            Expect<ReadyForQueryMessage>(await Connector.ReadMessage(async), Connector);
+
                         break;
+
                     default:
                         continue;
                     }
@@ -384,7 +411,8 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
             case ReaderState.Disposed:
                 return false;
             default:
-                throw new ArgumentOutOfRangeException();
+                ThrowHelper.ThrowArgumentOutOfRangeException();
+                return false;
             }
 
             Debug.Assert(State == ReaderState.BetweenResults);
@@ -452,8 +480,8 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
                 {
                     // Statement did not generate a resultset (e.g. INSERT)
                     // Read and process its completion message and move on to the next statement
-
-                    msg = await ReadMessage(async);
+                    // No need to read sequentially as it's not a DataRow
+                    msg = await Connector.ReadMessage(async);
                     switch (msg.Code)
                     {
                     case BackendMessageCode.CommandComplete:
@@ -463,11 +491,18 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
                         throw Connector.Break(new NotSupportedException(
                             "COPY isn't supported in regular command execution - see https://www.npgsql.org/doc/copy.html for documentation on COPY with Npgsql. " +
                             "If you are trying to execute a SQL script created by pg_dump, pass the '--inserts' switch to disable generating COPY statements."));
+                    case BackendMessageCode.CopyOutResponse:
+                        throw Connector.Break(new NotSupportedException(
+                            "COPY isn't supported in regular command execution - see https://www.npgsql.org/doc/copy.html for documentation on COPY with Npgsql."));
                     default:
                         throw Connector.UnexpectedMessageReceived(msg.Code);
                     }
 
                     ProcessMessage(msg);
+
+                    if (statement.AppendErrorBarrier ?? Command.EnableErrorBarriers)
+                        Expect<ReadyForQueryMessage>(await Connector.ReadMessage(async), Connector);
+
                     continue;
                 }
 
@@ -490,41 +525,54 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
                 switch (msg.Code)
                 {
                 case BackendMessageCode.DataRow:
+                    Connector.State = ConnectorState.Fetching;
+                    return true;
                 case BackendMessageCode.CommandComplete:
-                    break;
+                    if (statement.AppendErrorBarrier ?? Command.EnableErrorBarriers)
+                        Expect<ReadyForQueryMessage>(await Connector.ReadMessage(async), Connector);
+                    return true;
                 default:
                     throw Connector.UnexpectedMessageReceived(msg.Code);
                 }
-
-                return true;
             }
 
             // There are no more queries, we're done. Read the RFQ.
-            ProcessMessage(Expect<ReadyForQueryMessage>(await Connector.ReadMessage(async), Connector));
+            if (_statements.Count == 0 || !(_statements[_statements.Count - 1].AppendErrorBarrier ?? Command.EnableErrorBarriers))
+                Expect<ReadyForQueryMessage>(await Connector.ReadMessage(async), Connector);
+
+            State = ReaderState.Consumed;
             RowDescription = null;
             return false;
         }
         catch (Exception e)
         {
-            State = ReaderState.Consumed;
-
-            // Reference the triggering statement from the exception
             if (e is PostgresException postgresException && StatementIndex >= 0 && StatementIndex < _statements.Count)
             {
-                postgresException.BatchCommand = _statements[StatementIndex];
+                var statement = _statements[StatementIndex];
 
-                // Prevent the command or batch from by recycled (by the connection) when it's disposed. This is important since
+                // Reference the triggering statement from the exception
+                postgresException.BatchCommand = statement;
+
+                // Prevent the command or batch from being recycled (by the connection) when it's disposed. This is important since
                 // the exception is very likely to escape the using statement of the command, and by that time some other user may
                 // already be using the recycled instance.
-                if (!Command.IsWrappedByBatch)
+                Command.IsCacheable = false;
+
+                // If the schema of a table changes after a statement is prepared on that table, PostgreSQL errors with
+                // 0A000: cached plan must not change result type. 0A000 seems like a non-specific code, but it's very unlikely the
+                // statement would successfully execute anyway, so invalidate the prepared statement.
+                if (postgresException.SqlState == PostgresErrorCodes.FeatureNotSupported &&
+                    statement.PreparedStatement is { } preparedStatement)
                 {
-                    Command.IsCached = false;
+                    preparedStatement.State = PreparedState.Invalidated;
+                    Command.ResetPreparation();
+                    foreach (var s in Command.InternalBatchCommands)
+                        s.ResetPreparation();
                 }
             }
 
-            // An error means all subsequent statements were skipped by PostgreSQL.
-            // If any of them were being prepared, we need to update our bookkeeping to put
-            // them back in unprepared state.
+            // For the statement that errored, if it was being prepared we need to update our bookkeeping to put them back in unprepared
+            // state.
             for (; StatementIndex < _statements.Count; StatementIndex++)
             {
                 var statement = _statements[StatementIndex];
@@ -533,8 +581,33 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
                     statement.IsPreparing = false;
                     statement.PreparedStatement!.AbortPrepare();
                 }
+
+                // In normal, non-isolated batching, we've consumed the result set and are done.
+                // However, if the command has error barrier, we now have to consume results from the commands after it (unless it's the
+                // last one).
+                // Note that Consume calls NextResult (this method) recursively, the isConsuming flag tells us we're in this mode.
+                if ((statement.AppendErrorBarrier ?? Command.EnableErrorBarriers) && StatementIndex < _statements.Count - 1)
+                {
+                    if (isConsuming)
+                        throw;
+                    switch (State)
+                    {
+                    case ReaderState.Consumed:
+                    case ReaderState.Closed:
+                    case ReaderState.Disposed:
+                        // The exception may have caused the connector to break (e.g. I/O), and so the reader is already closed.
+                        break;
+                    default:
+                        // We provide Consume with the first exception which we've just caught.
+                        // If it encounters other exceptions while consuming the rest of the result set, it will raise an AggregateException,
+                        // otherwise it will rethrow this first exception.
+                        await Consume(async, firstException: e);
+                        break; // Never reached, Consume always throws above
+                    }
+                }
             }
 
+            State = ReaderState.Consumed;
             throw;
         }
     }
@@ -608,7 +681,8 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
             case ReaderState.Disposed:
                 return false;
             default:
-                throw new ArgumentOutOfRangeException();
+                ThrowHelper.ThrowArgumentOutOfRangeException();
+                return false;
             }
 
             for (StatementIndex++; StatementIndex < _statements.Count; StatementIndex++)
@@ -622,7 +696,27 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
                 }
                 else
                 {
+                    var pStatement = statement.PreparedStatement;
+                    if (pStatement != null)
+                    {
+                        Debug.Assert(!pStatement.IsPrepared);
+                        if (pStatement.StatementBeingReplaced != null)
+                        {
+                            Expect<CloseCompletedMessage>(await Connector.ReadMessage(async), Connector);
+                            pStatement.StatementBeingReplaced.CompleteUnprepare();
+                            pStatement.StatementBeingReplaced = null;
+                        }
+                    }
+
                     Expect<ParseCompleteMessage>(await Connector.ReadMessage(async), Connector);
+
+                    if (statement.IsPreparing)
+                    {
+                        pStatement!.State = PreparedState.Prepared;
+                        Connector.PreparedStatementManager.NumPrepared++;
+                        statement.IsPreparing = false;
+                    }
+
                     Expect<ParameterDescriptionMessage>(await Connector.ReadMessage(async), Connector);
                     var msg = await Connector.ReadMessage(async);
                     switch (msg.Code)
@@ -648,8 +742,9 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
             // There are no more queries, we're done. Read to the RFQ.
             if (!_statements.All(s => s.IsPrepared))
             {
-                ProcessMessage(Expect<ReadyForQueryMessage>(await Connector.ReadMessage(async), Connector));
+                Expect<ReadyForQueryMessage>(await Connector.ReadMessage(async), Connector);
                 RowDescription = null;
+                State = ReaderState.Consumed;
             }
 
             return false;
@@ -658,12 +753,28 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
         {
             State = ReaderState.Consumed;
 
-            // Reference the triggering statement from the exception (for batching)
-            if (e is PostgresException postgresException &&
-                Command.IsWrappedByBatch &&
-                StatementIndex >= 0 && StatementIndex < _statements.Count)
+            // Reference the triggering statement from the exception
+            if (e is PostgresException postgresException && StatementIndex >= 0 && StatementIndex < _statements.Count)
             {
                 postgresException.BatchCommand = _statements[StatementIndex];
+
+                // Prevent the command or batch from being recycled (by the connection) when it's disposed. This is important since
+                // the exception is very likely to escape the using statement of the command, and by that time some other user may
+                // already be using the recycled instance.
+                Command.IsCacheable = false;
+            }
+
+            // An error means all subsequent statements were skipped by PostgreSQL.
+            // If any of them were being prepared, we need to update our bookkeeping to put
+            // them back in unprepared state.
+            for (; StatementIndex < _statements.Count; StatementIndex++)
+            {
+                var statement = _statements[StatementIndex];
+                if (statement.IsPreparing)
+                {
+                    statement.IsPreparing = false;
+                    statement.PreparedStatement!.AbortPrepare();
+                }
             }
 
             throw;
@@ -691,6 +802,7 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
             case StatementType.Delete:
             case StatementType.Copy:
             case StatementType.Move:
+            case StatementType.Merge:
                 if (!_recordsAffected.HasValue)
                     _recordsAffected = 0;
                 _recordsAffected += completed.Rows;
@@ -704,19 +816,17 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
             State = ReaderState.BetweenResults;
             return;
 
-        case BackendMessageCode.ReadyForQuery:
-            State = ReaderState.Consumed;
-            return;
-
         default:
-            throw new Exception("Received unexpected backend message of type " + msg.Code);
+            ThrowUnexpectedBackendMessage(msg.Code);
+            return;
         }
+
+        static void ThrowUnexpectedBackendMessage(BackendMessageCode code)
+            => throw new Exception("Received unexpected backend message of type " + code);
     }
 
     void ProcessDataRowMessage(DataRowMessage msg)
     {
-        Connector.State = ConnectorState.Fetching;
-
         // The connector's buffer can actually change between DataRows:
         // If a large DataRow exceeding the connector's current read buffer arrives, and we're
         // reading in non-sequential mode, a new oversize buffer is allocated. We thus have to
@@ -763,8 +873,6 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
     }
 
     #endregion
-
-    void Cancel() => Connector.PerformPostgresCancellation();
 
     /// <summary>
     /// Gets a value indicating the depth of nesting for the current row.  Always returns zero.
@@ -857,14 +965,44 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
     /// Consumes all result sets for this reader, leaving the connector ready for sending and processing further
     /// queries
     /// </summary>
-    async Task Consume(bool async)
+    async Task Consume(bool async, Exception? firstException = null)
     {
-        // Skip over the other result sets. Note that this does tally records affected
-        // from CommandComplete messages, and properly sets state for auto-prepared statements
-        if (_isSchemaOnly)
-            while (await NextResultSchemaOnly(async, isConsuming: true)) {}
-        else
-            while (await NextResult(async, isConsuming: true)) {}
+        var exceptions = firstException is null ? null : new List<Exception> { firstException };
+
+        // Skip over the other result sets. Note that this does tally records affected from CommandComplete messages, and properly sets
+        // state for auto-prepared statements
+        while (true)
+        {
+            try
+            {
+                if (!(_isSchemaOnly
+                        ? await NextResultSchemaOnly(async, isConsuming: true)
+                        : await NextResult(async, isConsuming: true)))
+                {
+                    break;
+                }
+            }
+            catch (Exception e)
+            {
+                exceptions ??= new();
+                exceptions.Add(e);
+            }
+        }
+
+        Debug.Assert(exceptions?.Count != 0);
+
+        switch (exceptions?.Count)
+        {
+        case null:
+            return;
+        case 1:
+            ExceptionDispatchInfo.Capture(exceptions[0]).Throw();
+            return;
+        default:
+            throw new NpgsqlException(
+                "Multiple exceptions occurred when consuming the result set",
+                new AggregateException(exceptions));
+        }
     }
 
     /// <summary>
@@ -876,11 +1014,19 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
         {
             Close(connectionClosing: false, async: false, isDisposing: true).GetAwaiter().GetResult();
         }
-        catch (Exception e)
+        catch (Exception ex)
         {
-            Logger.LogError(e, "Exception caught while disposing a reader", Connector.Id);
-            if (e is not PostgresException)
+            // In the case of a PostgresException (or multiple ones, if we have error barriers), the reader's state has already been set
+            // to Disposed in Close above; in multiplexing, we also unbind the connector (with its reader), and at that point it can be used
+            // by other consumers. Therefore, we only set the state fo Disposed if the exception *wasn't* a PostgresException.
+            if (!(ex is PostgresException ||
+                  ex is NpgsqlException { InnerException: AggregateException aggregateException } &&
+                  aggregateException.InnerExceptions.All(e => e is PostgresException)))
+            {
                 State = ReaderState.Disposed;
+            }
+
+            throw;
         }
         finally
         {
@@ -892,7 +1038,7 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
     /// Releases the resources used by the <see cref="NpgsqlDataReader"/>.
     /// </summary>
 #if NETSTANDARD2_0
-        public ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
 #else
     public override ValueTask DisposeAsync()
 #endif
@@ -907,11 +1053,19 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
             {
                 await Close(connectionClosing: false, async: true, isDisposing: true);
             }
-            catch (Exception e)
+            catch (Exception ex)
             {
-                Logger.LogError(e, "Exception caught while disposing a reader", Connector.Id);
-                if (e is not PostgresException)
+                // In the case of a PostgresException (or multiple ones, if we have error barriers), the reader's state has already been set
+                // to Disposed in Close above; in multiplexing, we also unbind the connector (with its reader), and at that point it can be used
+                // by other consumers. Therefore, we only set the state fo Disposed if the exception *wasn't* a PostgresException.
+                if (!(ex is PostgresException ||
+                      ex is NpgsqlException { InnerException: AggregateException aggregateException } &&
+                      aggregateException.InnerExceptions.All(e => e is PostgresException)))
+                {
                     State = ReaderState.Disposed;
+                }
+
+                throw;
             }
             finally
             {
@@ -929,7 +1083,7 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
     /// Closes the <see cref="NpgsqlDataReader"/> reader, allowing a new command to be executed.
     /// </summary>
 #if NETSTANDARD2_0
-        public Task CloseAsync()
+    public Task CloseAsync()
 #else
     public override Task CloseAsync()
 #endif
@@ -940,7 +1094,7 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
 
     internal async Task Close(bool connectionClosing, bool async, bool isDisposing)
     {
-        if (State == ReaderState.Closed || State == ReaderState.Disposed)
+        if (State is ReaderState.Closed or ReaderState.Disposed)
         {
             if (isDisposing)
                 State = ReaderState.Disposed;
@@ -962,16 +1116,17 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
                 {
                     await Consume(async);
                 }
-                catch (Exception ex) when (
-                    ex is OperationCanceledException ||
-                    ex is NpgsqlException && ex.InnerException is TimeoutException)
+                catch (Exception ex) when (ex is OperationCanceledException or NpgsqlException { InnerException : TimeoutException })
                 {
                     // Timeout/cancellation - completely normal, consume has basically completed.
                 }
-                catch (PostgresException)
+                catch (Exception ex) when (
+                    ex is PostgresException ||
+                    ex is NpgsqlException { InnerException: AggregateException aggregateException } &&
+                    aggregateException.InnerExceptions.All(e => e is PostgresException))
                 {
-                    // In the case of a PostgresException, the connection is fine and consume has basically completed.
-                    // Defer throwing the exception until Cleanup is complete.
+                    // In the case of a PostgresException (or multiple ones, if we have error barriers), the connection is fine and consume
+                    // has basically completed. Defer throwing the exception until Cleanup is complete.
                     await Cleanup(async, connectionClosing, isDisposing);
                     throw;
                 }
@@ -999,33 +1154,44 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
 
     internal async Task Cleanup(bool async, bool connectionClosing = false, bool isDisposing = false)
     {
-        LogMessages.ReaderCleanup(Logger, Connector.Id);
+        LogMessages.ReaderCleanup(_commandLogger, Connector.Id);
 
         // If multiplexing isn't on, _sendTask contains the task for the writing of this command.
         // Make sure that this task, which may have executed asynchronously and in parallel with the reading,
-        // has completed, throwing any exceptions it generated.
-        // Note: if the following is removed, mysterious concurrent connection usage errors start happening
-        // on .NET Framework.
+        // has completed, throwing any exceptions it generated. If we don't do this, there's the possibility of a race condition where the
+        // user executes a new command after reader.Dispose() returns, but some additional write stuff is still finishing up from the last
+        // command.
         if (_sendTask != null)
         {
-            try
+            // If the connector is broken, we have no reason to wait for the sendTask to complete
+            // as we're not going to send anything else over it
+            // and that can lead to deadlocks (concurrent write and read failure, see #4804)
+            if (Connector.IsBroken)
             {
-                if (async)
-                    await _sendTask;
-                else
-                    _sendTask.GetAwaiter().GetResult();
+                // Prevent unobserved Task notifications by observing the failed Task exception.
+                _ = _sendTask.ContinueWith(t => _ = t.Exception, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Current);
             }
-            catch (Exception e)
+            else
             {
-                // TODO: think of a better way to handle exceptions, see #1323 and #3163
-                Logger.LogDebug(e, "Exception caught while sending the request", Connector.Id);
+                try
+                {
+                    if (async)
+                        await _sendTask;
+                    else
+                        _sendTask.GetAwaiter().GetResult();
+                }
+                catch (Exception e)
+                {
+                    // TODO: think of a better way to handle exceptions, see #1323 and #3163
+                    _commandLogger.LogDebug(e, "Exception caught while sending the request", Connector.Id);
+                }
             }
         }
 
         State = ReaderState.Closed;
         Command.State = CommandState.Idle;
         Connector.CurrentReader = null;
-        if (Logger.IsEnabled(LogLevel.Information))
+        if (_commandLogger.IsEnabled(LogLevel.Information))
             Command.LogExecutingCompleted(Connector, executing: false);
         NpgsqlEventSource.Log.CommandStop();
         Connector.EndUserAction();
@@ -1036,13 +1202,11 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
 
         if (_connection?.ConnectorBindingScope == ConnectorBindingScope.Reader)
         {
-            // We may unbind the current reader, which also sets the connector to null
-            var connector = Connector;
             UnbindIfNecessary();
 
             // TODO: Refactor... Use proper scope
             _connection.Connector = null;
-            connector.Connection = null;
+            Connector.Connection = null;
             _connection.ConnectorBindingScope = ConnectorBindingScope.None;
 
             // If the reader is being closed as part of the connection closing, we don't apply
@@ -1050,7 +1214,7 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
             if (_behavior.HasFlag(CommandBehavior.CloseConnection) && !connectionClosing)
                 _connection.Close();
 
-            connector.ReaderCompleted.SetResult(null);
+            Connector.ReaderCompleted.SetResult(null);
         }
         else if (_behavior.HasFlag(CommandBehavior.CloseConnection) && !connectionClosing)
         {
@@ -1316,32 +1480,22 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
     ValueTask<Stream> GetStream(int ordinal, bool async, CancellationToken cancellationToken = default) =>
         GetStreamInternal(CheckRowAndGetField(ordinal), ordinal, async, cancellationToken);
 
-    ValueTask<Stream> GetStreamInternal(FieldDescription field, int ordinal, bool async, CancellationToken cancellationToken = default)
+    async ValueTask<Stream> GetStreamInternal(FieldDescription field, int ordinal, bool async, CancellationToken cancellationToken = default)
     {
         if (_columnStream is { IsDisposed: false })
-            throw new InvalidOperationException("A stream is already open for this reader");
+            ThrowHelper.ThrowInvalidOperationException("A stream is already open for this reader");
 
-        var t = SeekToColumn(ordinal, async, cancellationToken);
-        if (!t.IsCompleted)
-            return new ValueTask<Stream>(GetStreamLong(this, field, t, cancellationToken));
+        using var registration = Connector.StartNestedCancellableOperation(cancellationToken, attemptPgCancellation: false);
+
+        await SeekToColumn(ordinal, async, cancellationToken);
+        if (_isSequential)
+            CheckColumnStart();
 
         if (ColumnLen == -1)
             ThrowHelper.ThrowInvalidCastException_NoValue(field);
 
         PosInColumn += ColumnLen;
-        return new ValueTask<Stream>(_columnStream = (NpgsqlReadBuffer.ColumnStream)Buffer.GetStream(ColumnLen, !_isSequential));
-
-        static async Task<Stream> GetStreamLong(NpgsqlDataReader reader, FieldDescription field, Task seekTask, CancellationToken cancellationToken)
-        {
-            using var registration = reader.Connector.StartNestedCancellableOperation(cancellationToken, attemptPgCancellation: false);
-
-            await seekTask;
-            if (reader.ColumnLen == -1)
-                ThrowHelper.ThrowInvalidCastException_NoValue(field);
-
-            reader.PosInColumn += reader.ColumnLen;
-            return reader._columnStream = (NpgsqlReadBuffer.ColumnStream)reader.Buffer.GetStream(reader.ColumnLen, !reader._isSequential);
-        }
+        return _columnStream = (NpgsqlReadBuffer.ColumnStream)Buffer.GetStream(ColumnLen, !_isSequential);
     }
 
     #endregion
@@ -1486,10 +1640,14 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
     async ValueTask<TextReader> GetTextReader(int ordinal, bool async, CancellationToken cancellationToken = default)
     {
         var field = CheckRowAndGetField(ordinal);
+
         if (field.Handler is ITextReaderHandler handler)
-            return handler.GetTextReader(async
+        {
+            var stream = async
                 ? await GetStreamInternal(field, ordinal, true, cancellationToken)
-                : GetStreamInternal(field, ordinal, false, CancellationToken.None).Result);
+                : GetStreamInternal(field, ordinal, false, CancellationToken.None).Result;
+            return handler.GetTextReader(stream, Buffer);
+        }
 
         throw new InvalidCastException($"The GetTextReader method is not supported for type {field.Handler.PgDisplayName}");
     }
@@ -1557,31 +1715,13 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
             ThrowHelper.ThrowInvalidCastException_NoValue(field);
         }
 
-        var position = Buffer.ReadPosition;
-        try
-        {
-            return NullableHandler<T>.Exists
-                ? NullableHandler<T>.Read(field.Handler, Buffer, ColumnLen, field)
-                : typeof(T) == typeof(object)
-                    ? (T)field.Handler.ReadAsObject(Buffer, ColumnLen, field)
-                    : field.Handler.Read<T>(Buffer, ColumnLen, field);
-        }
-        catch
-        {
-            if (Connector.State != ConnectorState.Broken)
-            {
-                var writtenBytes = Buffer.ReadPosition - position;
-                var remainingBytes = ColumnLen - writtenBytes;
-                if (remainingBytes > 0)
-                    Buffer.Skip(remainingBytes, false).GetAwaiter().GetResult();
-            }
-            throw;
-        }
-        finally
-        {
-            // Important: position must still be updated
-            PosInColumn += ColumnLen;
-        }
+        // We don't handle exceptions or update PosInColumn
+        // As with non-sequential reads we always just move to the start/end of the column
+        return NullableHandler<T>.Exists
+            ? NullableHandler<T>.Read(field.Handler, Buffer, ColumnLen, field)
+            : typeof(T) == typeof(object)
+                ? (T)field.Handler.ReadAsObject(Buffer, ColumnLen, field)
+                : field.Handler.Read<T>(Buffer, ColumnLen, field);
     }
 
     async ValueTask<T> GetFieldValueSequential<T>(int column, bool async, CancellationToken cancellationToken = default)
@@ -1699,51 +1839,6 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
     /// <summary>
     /// Gets the value of the specified column as an instance of <see cref="object"/>.
     /// </summary>
-    /// <param name="ordinal">The zero-based column ordinal.</param>
-    /// <returns>The value of the specified column.</returns>
-    public override object GetProviderSpecificValue(int ordinal)
-    {
-        var fieldDescription = CheckRowAndGetField(ordinal);
-
-        if (_isSequential)
-        {
-            SeekToColumnSequential(ordinal, false).GetAwaiter().GetResult();
-            CheckColumnStart();
-        }
-        else
-            SeekToColumnNonSequential(ordinal);
-
-        if (ColumnLen == -1)
-            return DBNull.Value;
-
-        var position = Buffer.ReadPosition;
-        try
-        {
-            return _isSequential
-                ? fieldDescription.Handler.ReadPsvAsObject(Buffer, ColumnLen, false, fieldDescription).GetAwaiter().GetResult()
-                : fieldDescription.Handler.ReadPsvAsObject(Buffer, ColumnLen, fieldDescription);
-        }
-        catch
-        {
-            if (Connector.State != ConnectorState.Broken)
-            {
-                var writtenBytes = Buffer.ReadPosition - position;
-                var remainingBytes = ColumnLen - writtenBytes;
-                if (remainingBytes > 0)
-                    Buffer.Skip(remainingBytes, false).GetAwaiter().GetResult();
-            }
-            throw;
-        }
-        finally
-        {
-            // Important: position must still be updated
-            PosInColumn += ColumnLen;
-        }
-    }
-
-    /// <summary>
-    /// Gets the value of the specified column as an instance of <see cref="object"/>.
-    /// </summary>
     /// <param name="name">The name of the column.</param>
     /// <returns>The value of the specified column.</returns>
     public override object this[string name] => GetValue(GetOrdinal(name));
@@ -1810,10 +1905,10 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
     public override int GetOrdinal(string name)
     {
         if (string.IsNullOrEmpty(name))
-            throw new ArgumentException("name cannot be empty", nameof(name));
+            ThrowHelper.ThrowArgumentException($"{nameof(name)} cannot be empty", nameof(name));
         CheckClosedOrDisposed();
         if (RowDescription is null)
-            throw new InvalidOperationException("No resultset is currently being traversed");
+            ThrowHelper.ThrowInvalidOperationException("No resultset is currently being traversed");
         return RowDescription.GetFieldIndex(name);
     }
 
@@ -1852,39 +1947,6 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
            ?? GetField(ordinal).FieldType;
 
     /// <summary>
-    /// Returns the provider-specific field type of the specified column.
-    /// </summary>
-    /// <param name="ordinal">The zero-based column ordinal.</param>
-    /// <returns>The Type object that describes the data type of the specified column.</returns>
-    public override Type GetProviderSpecificFieldType(int ordinal)
-    {
-        var fieldDescription = GetField(ordinal);
-        return fieldDescription.Handler.GetProviderSpecificFieldType(fieldDescription);
-    }
-
-    /// <summary>
-    /// Gets all provider-specific attribute columns in the collection for the current row.
-    /// </summary>
-    /// <param name="values">An array of Object into which to copy the attribute columns.</param>
-    /// <returns>The number of instances of <see cref="object"/> in the array.</returns>
-    public override int GetProviderSpecificValues(object[] values)
-    {
-        if (values == null)
-            throw new ArgumentNullException(nameof(values));
-        if (State != ReaderState.InResult)
-        {
-            throw State == ReaderState.Disposed
-                ? new ObjectDisposedException(nameof(NpgsqlDataReader))
-                : new InvalidOperationException("No row is available");
-        }
-
-        var count = Math.Min(FieldCount, values.Length);
-        for (var i = 0; i < count; i++)
-            values[i] = GetProviderSpecificValue(i);
-        return count;
-    }
-
-    /// <summary>
     /// Returns an <see cref="IEnumerator"/> that can be used to iterate through the rows in the data reader.
     /// </summary>
     /// <returns>An <see cref="IEnumerator"/> that can be used to iterate through the rows in the data reader.</returns>
@@ -1908,7 +1970,7 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
 #if NET5_0_OR_GREATER
     public new Task<ReadOnlyCollection<NpgsqlDbColumn>> GetColumnSchemaAsync(CancellationToken cancellationToken = default)
 #else
-        public Task<ReadOnlyCollection<NpgsqlDbColumn>> GetColumnSchemaAsync(CancellationToken cancellationToken = default)
+    public Task<ReadOnlyCollection<NpgsqlDbColumn>> GetColumnSchemaAsync(CancellationToken cancellationToken = default)
 #endif
     {
         using (NoSynchronizationContextScope.Enter())
@@ -1941,7 +2003,7 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
 #if NET5_0_OR_GREATER
     public override Task<DataTable?> GetSchemaTableAsync(CancellationToken cancellationToken = default)
 #else
-        public Task<DataTable?> GetSchemaTableAsync(CancellationToken cancellationToken = default)
+    public Task<DataTable?> GetSchemaTableAsync(CancellationToken cancellationToken = default)
 #endif
     {
         using (NoSynchronizationContextScope.Enter())
@@ -2118,7 +2180,7 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
             Debug.Assert(_column > -1);
 
             if (posInColumn < PosInColumn)
-                throw new InvalidOperationException("Attempt to read a position in the column which has already been read");
+                ThrowHelper.ThrowInvalidOperationException("Attempt to read a position in the column which has already been read");
 
             if (posInColumn > ColumnLen)
                 posInColumn = ColumnLen;
@@ -2180,7 +2242,7 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
     {
         Debug.Assert(State == ReaderState.InResult || State == ReaderState.BeforeResult);
 
-        if (_columnStream != null)
+        if (_columnStream is not null)
         {
             _columnStream.Dispose();
             _columnStream = null;
@@ -2194,24 +2256,25 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
 
     #region Checks
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     void CheckResultSet()
     {
         switch (State)
         {
         case ReaderState.BeforeResult:
         case ReaderState.InResult:
-            break;
+            return;
         case ReaderState.Closed:
-            throw new InvalidOperationException("The reader is closed");
+            ThrowHelper.ThrowInvalidOperationException("The reader is closed");
+            return;
         case ReaderState.Disposed:
-            throw new ObjectDisposedException(nameof(NpgsqlDataReader));
+            ThrowHelper.ThrowObjectDisposedException(nameof(NpgsqlDataReader));
+            return;
         default:
-            throw new InvalidOperationException("No resultset is currently being traversed");
+            ThrowHelper.ThrowInvalidOperationException("No resultset is currently being traversed");
+            return;
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     FieldDescription CheckRowAndGetField(int column)
     {
         switch (State)
@@ -2219,15 +2282,18 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
         case ReaderState.InResult:
             break;
         case ReaderState.Closed:
-            throw new InvalidOperationException("The reader is closed");
+            ThrowHelper.ThrowInvalidOperationException("The reader is closed");
+            break;
         case ReaderState.Disposed:
-            throw new ObjectDisposedException(nameof(NpgsqlDataReader));
+            ThrowHelper.ThrowObjectDisposedException(nameof(NpgsqlDataReader));
+            break;
         default:
-            throw new InvalidOperationException("No row is available");
+            ThrowHelper.ThrowInvalidOperationException("No row is available");
+            break;
         }
 
         if (column < 0 || column >= RowDescription!.Count)
-            throw new IndexOutOfRangeException($"Column must be between {0} and {RowDescription!.Count - 1}");
+            ThrowColumnOutOfRange(RowDescription!.Count);
 
         return RowDescription[column];
     }
@@ -2236,37 +2302,39 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
     /// Checks that we have a RowDescription, but not necessary an actual resultset
     /// (for operations which work in SchemaOnly mode.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     FieldDescription GetField(int column)
     {
-        if (RowDescription == null)
-            throw new InvalidOperationException("No resultset is currently being traversed");
+        if (RowDescription is null)
+            ThrowHelper.ThrowInvalidOperationException("No resultset is currently being traversed");
 
         if (column < 0 || column >= RowDescription.Count)
-            throw new IndexOutOfRangeException($"Column must be between {0} and {RowDescription.Count - 1}");
+            ThrowColumnOutOfRange(RowDescription.Count);
 
         return RowDescription[column];
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     void CheckColumnStart()
     {
         Debug.Assert(_isSequential);
         if (PosInColumn != 0)
-            throw new InvalidOperationException("Attempt to read a position in the column which has already been read");
+            ThrowHelper.ThrowInvalidOperationException("Attempt to read a position in the column which has already been read");
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     void CheckClosedOrDisposed()
     {
         switch (State)
         {
         case ReaderState.Closed:
-            throw new InvalidOperationException("The reader is closed");
+            ThrowHelper.ThrowInvalidOperationException("The reader is closed");
+            return;
         case ReaderState.Disposed:
-            throw new ObjectDisposedException(nameof(NpgsqlDataReader));
+            ThrowHelper.ThrowObjectDisposedException(nameof(NpgsqlDataReader));
+            return;
         }
     }
+
+    static void ThrowColumnOutOfRange(int maxIndex) =>
+        throw new IndexOutOfRangeException($"Column must be between {0} and {maxIndex - 1}");
 
     #endregion
 
@@ -2279,7 +2347,7 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
     internal void UnbindIfNecessary()
     {
         // We're closing the connection, but reader is not yet disposed
-        // We have to unbind the reader from the connector, otherwise there could be a concurency issues
+        // We have to unbind the reader from the connector, otherwise there could be a concurrency issues
         // See #3126 and #3290
         if (State != ReaderState.Disposed)
         {

@@ -32,9 +32,6 @@ public partial class BitStringHandler : NpgsqlTypeHandler<BitArray>,
     public override Type GetFieldType(FieldDescription? fieldDescription = null)
         => fieldDescription != null && fieldDescription.TypeModifier == 1 ? typeof(bool) : typeof(BitArray);
 
-    public override Type GetProviderSpecificFieldType(FieldDescription? fieldDescription = null)
-        => GetFieldType(fieldDescription);
-
     // BitString requires a special array handler which returns bool or BitArray
     /// <inheritdoc />
     public override NpgsqlTypeHandler CreateArrayHandler(PostgresArrayType pgArrayType, ArrayNullabilityMode arrayNullabilityMode)
@@ -260,38 +257,15 @@ public partial class BitStringHandler : NpgsqlTypeHandler<BitArray>,
 /// should be considered somewhat unstable, and may change in breaking ways, including in non-major releases.
 /// Use it at your own risk.
 /// </remarks>
-public class BitStringArrayHandler : ArrayHandler<BitArray>
+public class BitStringArrayHandler : ArrayHandler
 {
     /// <inheritdoc />
     public BitStringArrayHandler(PostgresType postgresType, BitStringHandler elementHandler, ArrayNullabilityMode arrayNullabilityMode)
-        : base(postgresType, elementHandler, arrayNullabilityMode) {}
+        : base(postgresType, elementHandler, arrayNullabilityMode)
+    { }
 
-    /// <inheritdoc />
-    protected internal override async ValueTask<TRequestedArray> ReadCustom<TRequestedArray>(NpgsqlReadBuffer buf, int len, bool async, FieldDescription? fieldDescription = null)
-    {
-        if (ArrayTypeInfo<TRequestedArray>.ElementType == typeof(BitArray))
-        {
-            if (ArrayTypeInfo<TRequestedArray>.IsArray)
-                return (TRequestedArray)(object)await ReadArray<BitArray>(buf, async);
-
-            if (ArrayTypeInfo<TRequestedArray>.IsList)
-                return (TRequestedArray)(object)await ReadList<BitArray>(buf, async);
-        }
-
-        if (ArrayTypeInfo<TRequestedArray>.ElementType == typeof(bool))
-        {
-            if (ArrayTypeInfo<TRequestedArray>.IsArray)
-                return (TRequestedArray)(object)await ReadArray<bool>(buf, async);
-
-            if (ArrayTypeInfo<TRequestedArray>.IsList)
-                return (TRequestedArray)(object)await ReadList<bool>(buf, async);
-        }
-
-        return await base.ReadCustom<TRequestedArray>(buf, len, async, fieldDescription);
-    }
-
-    public override async ValueTask<object> ReadAsObject(NpgsqlReadBuffer buf, int len, bool async, FieldDescription? fieldDescription = null)
+    public override ValueTask<object> ReadAsObject(NpgsqlReadBuffer buf, int len, bool async, FieldDescription? fieldDescription = null)
         => fieldDescription?.TypeModifier == 1
-            ? await ReadArray<bool>(buf, async)
-            : await ReadArray<BitArray>(buf, async);
+            ? base.ReadAsObject(typeof(bool), buf, len, async, fieldDescription)
+            : base.ReadAsObject(buf, len, async, fieldDescription);
 }

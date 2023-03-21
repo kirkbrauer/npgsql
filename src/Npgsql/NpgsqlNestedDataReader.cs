@@ -10,6 +10,7 @@ using System.Data.Common;
 using System.Globalization;
 using System.IO;
 using System.Runtime.CompilerServices;
+using Npgsql.Internal.TypeMapping;
 
 namespace Npgsql;
 
@@ -48,7 +49,7 @@ public sealed class NpgsqlNestedDataReader : DbDataReader
     }
 
     NpgsqlReadBuffer Buffer => _outermostReader.Buffer;
-    ConnectorTypeMapper TypeMapper => _outermostReader.Connector.TypeMapper;
+    TypeMapper TypeMapper => _outermostReader.Connector.TypeMapper;
 
     internal NpgsqlNestedDataReader(NpgsqlDataReader outermostReader, NpgsqlNestedDataReader? outerNestedReader,
         ulong uniqueOutermostReaderRowId, int depth, PostgresCompositeType? compositeType)
@@ -345,35 +346,6 @@ public sealed class NpgsqlNestedDataReader : DbDataReader
             : typeof(T) == typeof(object)
                 ? (T)field.Handler.ReadAsObject(Buffer, field.Length, fieldDescription: null)
                 : field.Handler.Read<T>(Buffer, field.Length, fieldDescription: null);
-    }
-
-    /// <inheritdoc />
-    public override Type GetProviderSpecificFieldType(int ordinal)
-    {
-        var column = CheckRowAndColumn(ordinal);
-        return column.TypeHandler.GetProviderSpecificFieldType();
-    }
-
-    /// <inheritdoc />
-    public override object GetProviderSpecificValue(int ordinal)
-    {
-        var column = CheckRowAndColumnAndSeek(ordinal);
-        if (column.Length == -1)
-            return DBNull.Value;
-        return column.Handler.ReadPsvAsObject(Buffer, column.Length);
-    }
-
-    /// <inheritdoc />
-    public override int GetProviderSpecificValues(object[] values)
-    {
-        if (values == null)
-            throw new ArgumentNullException(nameof(values));
-        CheckOnRow();
-
-        var count = Math.Min(FieldCount, values.Length);
-        for (var i = 0; i < count; i++)
-            values[i] = GetProviderSpecificValue(i);
-        return count;
     }
 
     /// <inheritdoc />

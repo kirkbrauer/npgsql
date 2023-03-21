@@ -9,7 +9,7 @@ on:
       - '*'
 
 env:
-  dotnet_sdk_version: '6.0.x'
+  dotnet_sdk_version: '8.0.100-preview.2.23157.25'
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
 
 jobs:
@@ -29,7 +29,7 @@ jobs:
             ${{ runner.os }}-nuget-
 
       - name: Setup .NET Core SDK
-        uses: actions/setup-dotnet@v2
+        uses: actions/setup-dotnet@v3.0.3
         with:
           dotnet-version: ${{ env.dotnet_sdk_version }}
 

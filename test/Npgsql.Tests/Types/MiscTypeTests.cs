@@ -3,6 +3,7 @@ using System.Data;
 using System.Threading.Tasks;
 using NpgsqlTypes;
 using NUnit.Framework;
+using NUnit.Framework.Constraints;
 
 namespace Npgsql.Tests.Types;
 
@@ -66,25 +67,99 @@ class MiscTypeTests : MultiplexingTestBase
         }
     }
 
-    [Test, Description("PostgreSQL records should be returned as arrays of objects")]
+    #region Record
+
+    [Test]
     [IssueLink("https://github.com/npgsql/npgsql/issues/724")]
     [IssueLink("https://github.com/npgsql/npgsql/issues/1980")]
-    public async Task Record()
+    public async Task Read_Record_as_object_array()
     {
         var recordLiteral = "(1,'foo'::text)::record";
         await using var conn = await OpenConnectionAsync();
         await using var cmd = new NpgsqlCommand($"SELECT {recordLiteral}, ARRAY[{recordLiteral}, {recordLiteral}]", conn);
         await using var reader = await cmd.ExecuteReaderAsync();
         reader.Read();
+
         var record = (object[])reader[0];
         Assert.That(record[0], Is.EqualTo(1));
         Assert.That(record[1], Is.EqualTo("foo"));
 
-        var arr = (object[][])reader[1];
-        Assert.That(arr.Length, Is.EqualTo(2));
-        Assert.That(arr[0][0], Is.EqualTo(1));
-        Assert.That(arr[1][0], Is.EqualTo(1));
+        var array = (object[][])reader[1];
+        Assert.That(array.Length, Is.EqualTo(2));
+        Assert.That(array[0][0], Is.EqualTo(1));
+        Assert.That(array[1][0], Is.EqualTo(1));
     }
+
+    [Test]
+    public async Task Read_Record_as_ValueTuple()
+    {
+        var recordLiteral = "(1,'foo'::text)::record";
+        await using var conn = await OpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand($"SELECT {recordLiteral}, ARRAY[{recordLiteral}, {recordLiteral}]", conn);
+        await using var reader = await cmd.ExecuteReaderAsync();
+        reader.Read();
+
+        var record = reader.GetFieldValue<(int, string)>(0);
+        Assert.That(record.Item1, Is.EqualTo(1));
+        Assert.That(record.Item2, Is.EqualTo("foo"));
+
+        var array = (object[][])reader[1];
+        Assert.That(array.Length, Is.EqualTo(2));
+        Assert.That(array[0][0], Is.EqualTo(1));
+        Assert.That(array[1][0], Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task Read_Record_as_Tuple()
+    {
+        var recordLiteral = "(1,'foo'::text)::record";
+        await using var conn = await OpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand($"SELECT {recordLiteral}, ARRAY[{recordLiteral}, {recordLiteral}]", conn);
+        await using var reader = await cmd.ExecuteReaderAsync();
+        reader.Read();
+
+        var record = reader.GetFieldValue<Tuple<int, string>>(0);
+        Assert.That(record.Item1, Is.EqualTo(1));
+        Assert.That(record.Item2, Is.EqualTo("foo"));
+
+        var array = (object[][])reader[1];
+        Assert.That(array.Length, Is.EqualTo(2));
+        Assert.That(array[0][0], Is.EqualTo(1));
+        Assert.That(array[1][0], Is.EqualTo(1));
+    }
+
+    [Test]
+    public Task Write_Record_is_not_supported()
+        => AssertTypeUnsupportedWrite<object[], NotSupportedException>(new object[] { 1, "foo" }, "record");
+
+    [Test]
+    public async Task Records_supported_only_with_EnableRecords([Values] bool withMappings)
+    {
+        const string unsupportedMessage =
+            "Records aren't supported; please call EnableRecords on NpgsqlSlimDataSourceBuilder to enable records.";
+        Func<IResolveConstraint> assertExpr = () => withMappings
+            ? Throws.Nothing
+            : Throws.Exception
+                .TypeOf<NotSupportedException>()
+                .With.Property("Message").EqualTo(unsupportedMessage);
+
+        var dataSourceBuilder = new NpgsqlSlimDataSourceBuilder(ConnectionString);
+        if (withMappings)
+            dataSourceBuilder.EnableRecords();
+        var dataSource = dataSourceBuilder.Build();
+        await using var conn = await dataSource.OpenConnectionAsync();
+        await using var cmd = conn.CreateCommand();
+
+        // RecordHandler doesn't support writing, so we only check for reading
+        cmd.CommandText = "SELECT ('one'::text, 2)";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        await reader.ReadAsync();
+
+        Assert.That(() => reader.GetValue(0), assertExpr());
+        Assert.That(() => reader.GetFieldValue<object[]>(0), assertExpr());
+    }
+
+    #endregion Record
 
     [Test, Description("Makes sure that setting DbType.Object makes Npgsql infer the type")]
     [IssueLink("https://github.com/npgsql/npgsql/issues/694")]

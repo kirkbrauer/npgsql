@@ -92,24 +92,6 @@ public abstract class NpgsqlTypeHandler
     }
 
     /// <summary>
-    /// Reads a column as the type handler's provider-specific type. If it is not already entirely in
-    /// memory, sync or async I/O will be performed as specified by <paramref name="async"/>.
-    /// </summary>
-    internal virtual ValueTask<object> ReadPsvAsObject(NpgsqlReadBuffer buf, int len, bool async, FieldDescription? fieldDescription = null)
-        => ReadAsObject(buf, len, async, fieldDescription);
-
-    /// <summary>
-    /// Version of <see cref="ReadPsvAsObject(NpgsqlReadBuffer,int,bool,FieldDescription?)"/> that's called when we know the entire value
-    /// is already buffered in memory (i.e. in non-sequential mode).
-    /// </summary>
-    internal virtual object ReadPsvAsObject(NpgsqlReadBuffer buf, int len, FieldDescription? fieldDescription = null)
-    {
-        Debug.Assert(buf.ReadBytesLeft >= len);
-
-        return ReadPsvAsObject(buf, len, async: false, fieldDescription).Result;
-    }
-
-    /// <summary>
     /// Reads a value from the buffer, assuming our read position is at the value's preceding length.
     /// If the length is -1 (null), this method will return the default value.
     /// </summary>
@@ -135,7 +117,7 @@ public abstract class NpgsqlTypeHandler
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     protected internal int ValidateAndGetLength<TAny>(
-        [DisallowNull] TAny value, [NotNullIfNotNull("lengthCache")] ref NpgsqlLengthCache? lengthCache, NpgsqlParameter? parameter)
+        [DisallowNull] TAny value, [NotNullIfNotNull(nameof(lengthCache))] ref NpgsqlLengthCache? lengthCache, NpgsqlParameter? parameter)
     {
         Debug.Assert(value is not DBNull);
 
@@ -148,17 +130,22 @@ public abstract class NpgsqlTypeHandler
     }
 
     protected internal virtual int ValidateAndGetLengthCustom<TAny>(
-        [DisallowNull] TAny value, [NotNullIfNotNull("lengthCache")] ref NpgsqlLengthCache? lengthCache, NpgsqlParameter? parameter)
+        [DisallowNull] TAny value, [NotNullIfNotNull(nameof(lengthCache))] ref NpgsqlLengthCache? lengthCache, NpgsqlParameter? parameter) =>
+        ValidateAndGetLengthCustomCore(parameter, typeof(TAny), PgDisplayName);
+
+    static int ValidateAndGetLengthCustomCore(NpgsqlParameter? parameter, Type type, string displayName)
     {
         var parameterName = parameter is null
             ? null
             : parameter.TrimmedName == string.Empty
-                ? $"${parameter.Collection!.IndexOf(parameter) + 1}"
+                ? parameter.Collection is { } paramCollection
+                    ? $"${paramCollection.IndexOf(parameter) + 1}"
+                    : null // in case of COPY operations parameter isn't bound to a collection
                 : parameter.TrimmedName;
 
         throw new InvalidCastException(parameterName is null
-            ? $"Cannot write a value of CLR type '{typeof(TAny)}' as database type '{PgDisplayName}'."
-            : $"Cannot write a value of CLR type '{typeof(TAny)}' as database type '{PgDisplayName}' for parameter '{parameterName}'.");
+            ? $"Cannot write a value of CLR type '{type}' as database type '{displayName}'."
+            : $"Cannot write a value of CLR type '{type}' as database type '{displayName}' for parameter '{parameterName}'.");
     }
 
     /// <summary>
@@ -254,7 +241,6 @@ public abstract class NpgsqlTypeHandler
     #region Misc
 
     public abstract Type GetFieldType(FieldDescription? fieldDescription = null);
-    public abstract Type GetProviderSpecificFieldType(FieldDescription? fieldDescription = null);
 
     internal virtual bool PreferTextWrite => false;
 

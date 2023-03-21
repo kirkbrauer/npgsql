@@ -16,6 +16,10 @@ public class DateTimeTests : TestBase
     public Task Date_as_DateTime()
         => AssertType(new DateTime(2020, 10, 1), "2020-10-01", "date", NpgsqlDbType.Date, DbType.Date, isDefaultForWriting: false);
 
+    [Test]
+    public Task Date_as_DateTime_with_date_and_time_before_2000()
+        => AssertTypeWrite(new DateTime(1980, 10, 1, 11, 0, 0), "1980-10-01", "date", NpgsqlDbType.Date, DbType.Date, isDefault: false);
+
     // Internal PostgreSQL representation (days since 2020-01-01), for out-of-range values.
     [Test]
     public Task Date_as_int()
@@ -114,10 +118,8 @@ public class DateTimeTests : TestBase
     [Test]
     public async Task TimeTz_as_DateTimeOffset()
     {
-        await AssertTypeRead(
-            new DateTimeOffset(1, 1, 2, 13, 3, 45, 510, TimeSpan.FromHours(2)),
-            "13:03:45.51+02",
-            "time with time zone");
+        await AssertTypeRead("13:03:45.51+02",
+            "time with time zone", new DateTimeOffset(1, 1, 2, 13, 3, 45, 510, TimeSpan.FromHours(2)));
 
         await AssertTypeWrite(
             new DateTimeOffset(1, 1, 1, 13, 3, 45, 510, TimeSpan.FromHours(2)),
@@ -129,10 +131,8 @@ public class DateTimeTests : TestBase
 
     [Test]
     public Task TimeTz_before_utc_zero()
-        => AssertTypeRead(
-            new DateTimeOffset(1, 1, 2, 1, 0, 0, new TimeSpan(0, 2, 0, 0)),
-            "01:00:00+02",
-            "time with time zone");
+        => AssertTypeRead("01:00:00+02",
+            "time with time zone", new DateTimeOffset(1, 1, 2, 1, 0, 0, new TimeSpan(0, 2, 0, 0)));
 
     #endregion
 
@@ -419,13 +419,13 @@ public class DateTimeTests : TestBase
 
     #endregion
 
-    protected override async ValueTask<NpgsqlConnection> OpenConnectionAsync(string? connectionString = null)
+    protected override async ValueTask<NpgsqlConnection> OpenConnectionAsync()
     {
-        var conn = await base.OpenConnectionAsync(connectionString);
+        var conn = await base.OpenConnectionAsync();
         await conn.ExecuteNonQueryAsync("SET TimeZone='Europe/Berlin'");
         return conn;
     }
 
-    protected override NpgsqlConnection OpenConnection(string? connectionString = null)
+    protected override NpgsqlConnection OpenConnection()
         => throw new NotSupportedException();
 }

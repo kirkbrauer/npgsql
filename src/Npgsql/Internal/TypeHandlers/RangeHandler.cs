@@ -34,11 +34,10 @@ public partial class RangeHandler<TSubtype> : NpgsqlTypeHandler, INpgsqlTypeHand
         => SubtypeHandler = subtypeHandler;
 
     public override Type GetFieldType(FieldDescription? fieldDescription = null) => typeof(NpgsqlRange<TSubtype>);
-    public override Type GetProviderSpecificFieldType(FieldDescription? fieldDescription = null) => typeof(NpgsqlRange<TSubtype>);
 
     /// <inheritdoc />
     public override NpgsqlTypeHandler CreateArrayHandler(PostgresArrayType pgArrayType, ArrayNullabilityMode arrayNullabilityMode)
-        => new ArrayHandler<NpgsqlRange<TSubtype>>(pgArrayType, this, arrayNullabilityMode);
+        => new ArrayHandler(pgArrayType, this, arrayNullabilityMode);
 
     /// <inheritdoc />
     public override NpgsqlTypeHandler CreateRangeHandler(PostgresType pgRangeType)
@@ -167,8 +166,8 @@ public class RangeHandler<TSubtype1, TSubtype2> : RangeHandler<TSubtype1>, INpgs
     public override int ValidateObjectAndGetLength(object? value, ref NpgsqlLengthCache? lengthCache, NpgsqlParameter? parameter)
         => value switch
         {
-            NpgsqlRange<TSubtype1> converted => ((INpgsqlTypeHandler<NpgsqlRange<TSubtype1>>)this).ValidateAndGetLength(converted, ref lengthCache, parameter),
-            NpgsqlRange<TSubtype2> converted => ((INpgsqlTypeHandler<NpgsqlRange<TSubtype2>>)this).ValidateAndGetLength(converted, ref lengthCache, parameter),
+            NpgsqlRange<TSubtype1> converted => ValidateAndGetLength(converted, ref lengthCache, parameter),
+            NpgsqlRange<TSubtype2> converted => ValidateAndGetLength(converted, ref lengthCache, parameter),
 
             DBNull => 0,
             null => 0,
@@ -178,8 +177,8 @@ public class RangeHandler<TSubtype1, TSubtype2> : RangeHandler<TSubtype1>, INpgs
     public override Task WriteObjectWithLength(object? value, NpgsqlWriteBuffer buf, NpgsqlLengthCache? lengthCache, NpgsqlParameter? parameter, bool async, CancellationToken cancellationToken = default)
         => value switch
         {
-            NpgsqlRange<TSubtype1> converted => WriteWithLength(converted, buf, lengthCache, parameter, async, cancellationToken),
-            NpgsqlRange<TSubtype2> converted => WriteWithLength(converted, buf, lengthCache, parameter, async, cancellationToken),
+            NpgsqlRange<TSubtype1> converted => ((INpgsqlTypeHandler<NpgsqlRange<TSubtype1>>)this).WriteWithLength(converted, buf, lengthCache, parameter, async, cancellationToken),
+            NpgsqlRange<TSubtype2> converted => ((INpgsqlTypeHandler<NpgsqlRange<TSubtype2>>)this).WriteWithLength(converted, buf, lengthCache, parameter, async, cancellationToken),
 
             DBNull => WriteWithLength(DBNull.Value, buf, lengthCache, parameter, async, cancellationToken),
             null => WriteWithLength(DBNull.Value, buf, lengthCache, parameter, async, cancellationToken),

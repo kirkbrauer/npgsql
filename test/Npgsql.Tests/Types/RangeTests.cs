@@ -3,6 +3,7 @@ using System.ComponentModel;
 using System.Data;
 using System.Globalization;
 using System.Threading.Tasks;
+using Npgsql.Util;
 using NpgsqlTypes;
 using NUnit.Framework;
 
@@ -21,13 +22,8 @@ class RangeTests : MultiplexingTestBase
         if (IsMultiplexing)
             Assert.Ignore("Multiplexing, ReloadTypes");
 
-        var csb = new NpgsqlConnectionStringBuilder(ConnectionString)
-        {
-            ApplicationName = nameof(Range_resolution), // Prevent backend type caching in TypeHandlerRegistry
-            Pooling = false
-        };
-
-        using var conn = await OpenConnectionAsync(csb);
+        await using var dataSource = CreateDataSource(csb => csb.Pooling = false);
+        await using var conn = await OpenConnectionAsync();
 
         // Resolve type by NpgsqlDbType
         using (var cmd = new NpgsqlCommand("SELECT @p", conn))
@@ -102,13 +98,10 @@ class RangeTests : MultiplexingTestBase
     [NonParallelizable]
     public async Task Range_with_long_subtype()
     {
-        var csb = new NpgsqlConnectionStringBuilder(ConnectionString)
-        {
-            MaxPoolSize = 1
-        };
-        await using var conn = await OpenConnectionAsync(csb);
+        await using var dataSource = CreateDataSource(csb => csb.MaxPoolSize = 1);
+        await using var conn = await dataSource.OpenConnectionAsync();
 
-        await using var _ = await GetTempTypeName(conn, out var typeName);
+        var typeName = await GetTempTypeName(conn);
         await conn.ExecuteNonQueryAsync($"CREATE TYPE {typeName} AS RANGE(subtype=text)");
         await Task.Yield(); // TODO: fix multiplexing deadlock bug
         conn.ReloadTypes();
@@ -224,12 +217,38 @@ class RangeTests : MultiplexingTestBase
         Assert.That(actual, Is.EqualTo(range));
     }
 
-    [OneTimeSetUp]
-    public async Task OneTimeSetUp()
+    [Test, IssueLink("https://github.com/npgsql/npgsql/issues/4441")]
+    public async Task Array_of_range()
     {
-        using var conn = await OpenConnectionAsync();
-        TestUtil.MinimumPgVersion(conn, "9.2.0");
+        bool supportsMultirange;
+
+        await using (var conn = await OpenConnectionAsync())
+        {
+            supportsMultirange = conn.PostgreSqlVersion.IsGreaterOrEqual(14);
+        }
+
+        // Starting with PG14, we map CLR NpgsqlRange<T>[] to PG multiranges by default, but also support mapping to PG array of range.
+        // (wee also MultirangeTests for additional multirange-specific tests).
+        // Earlier versions don't have multirange, so the default mapping is to PG array of range.
+
+        // Note that when NpgsqlDbType inference, we don't know the PG version (since NpgsqlParameter can exist in isolation). So
+        // if NpgsqlParameter.Value is set to NpgsqlRange<T>[], NpgsqlDbType always returns multirange (hence
+        // isNpgsqlDbTypeInferredFromClrType is false).
+        await AssertType(
+            new NpgsqlRange<int>[]
+            {
+                new(3, lowerBoundIsInclusive: true, 4, upperBoundIsInclusive: false),
+                new(5, lowerBoundIsInclusive: true, 6, upperBoundIsInclusive: false)
+            },
+            @"{""[3,4)"",""[5,6)""}",
+            "int4range[]",
+            NpgsqlDbType.IntegerRange | NpgsqlDbType.Array,
+            isDefaultForWriting: !supportsMultirange,
+            isNpgsqlDbTypeInferredFromClrType: false);
     }
+
+    protected override NpgsqlConnection OpenConnection()
+        => throw new NotSupportedException();
 
     #region ParseTests
 

@@ -5,6 +5,8 @@ using System.Data;
 using System.Data.Common;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.Runtime.CompilerServices;
+using Npgsql.Internal.TypeMapping;
 using Npgsql.TypeMapping;
 using NpgsqlTypes;
 
@@ -22,7 +24,7 @@ public sealed class NpgsqlParameterCollection : DbParameterCollection, IList<Npg
 #if DEBUG
     internal static bool TwoPassCompatMode;
 #else
-        internal static readonly bool TwoPassCompatMode;
+    internal static readonly bool TwoPassCompatMode;
 #endif
 
     static NpgsqlParameterCollection()
@@ -51,11 +53,10 @@ public sealed class NpgsqlParameterCollection : DbParameterCollection, IList<Npg
         if (_caseInsensitiveLookup is null)
             return;
 
-        if (TwoPassCompatMode && !_caseSensitiveLookup!.ContainsKey(name))
-            _caseSensitiveLookup[name] = index;
+        if (TwoPassCompatMode)
+            _caseSensitiveLookup!.TryAdd(name, index);
 
-        if (!_caseInsensitiveLookup.ContainsKey(name))
-            _caseInsensitiveLookup[name] = index;
+        _caseInsensitiveLookup.TryAdd(name, index);
     }
 
     void LookupInsert(string name, int index)
@@ -208,9 +209,9 @@ public sealed class NpgsqlParameterCollection : DbParameterCollection, IList<Npg
         set
         {
             if (value is null)
-                throw new ArgumentNullException(nameof(value));
+                ThrowHelper.ThrowArgumentNullException(nameof(value));
             if (value.Collection is not null)
-                throw new InvalidOperationException("The parameter already belongs to a collection");
+                ThrowHelper.ThrowInvalidOperationException("The parameter already belongs to a collection");
 
             var oldValue = InternalList[index];
 
@@ -233,9 +234,9 @@ public sealed class NpgsqlParameterCollection : DbParameterCollection, IList<Npg
     public NpgsqlParameter Add(NpgsqlParameter value)
     {
         if (value is null)
-            throw new ArgumentNullException(nameof(value));
+            ThrowHelper.ThrowArgumentNullException(nameof(value));
         if (value.Collection is not null)
-            throw new InvalidOperationException("The parameter already belongs to a collection");
+            ThrowHelper.ThrowInvalidOperationException("The parameter already belongs to a collection");
 
         InternalList.Add(value);
         value.Collection = this;
@@ -387,7 +388,7 @@ public sealed class NpgsqlParameterCollection : DbParameterCollection, IList<Npg
             for (var i = 0; i < InternalList.Count; i++)
             {
                 var name = InternalList[i].TrimmedName;
-                if (string.Equals(parameterName, InternalList[i].TrimmedName))
+                if (string.Equals(parameterName, name))
                     return i;
             }
         }
@@ -448,11 +449,11 @@ public sealed class NpgsqlParameterCollection : DbParameterCollection, IList<Npg
     public void Remove(string parameterName)
     {
         if (parameterName is null)
-            throw new ArgumentNullException(nameof(parameterName));
+            ThrowHelper.ThrowArgumentNullException(nameof(parameterName));
 
         var index = IndexOf(parameterName);
         if (index < 0)
-            throw new InvalidOperationException("No parameter with the specified name exists in the collection");
+            ThrowHelper.ThrowInvalidOperationException("No parameter with the specified name exists in the collection");
 
         RemoveAt(index);
     }
@@ -566,7 +567,7 @@ public sealed class NpgsqlParameterCollection : DbParameterCollection, IList<Npg
             throw new ArgumentNullException(nameof(values));
 
         foreach (var parameter in values)
-            Add(Cast(parameter) ?? throw new ArgumentException("Collection contains a null value.", nameof(values)));
+            Add(Cast(parameter));
     }
 
     /// <inheritdoc />
@@ -626,9 +627,9 @@ public sealed class NpgsqlParameterCollection : DbParameterCollection, IList<Npg
     public bool Remove(NpgsqlParameter item)
     {
         if (item == null)
-            throw new ArgumentNullException(nameof(item));
+            ThrowHelper.ThrowArgumentNullException(nameof(item));
         if (item.Collection != this)
-            throw new InvalidOperationException("The item does not belong to this collection");
+            ThrowHelper.ThrowInvalidOperationException("The item does not belong to this collection");
 
         var index = IndexOf(item);
         if (index >= 0)
@@ -680,7 +681,7 @@ public sealed class NpgsqlParameterCollection : DbParameterCollection, IList<Npg
         }
     }
 
-    internal void ProcessParameters(ConnectorTypeMapper typeMapper, bool validate)
+    internal void ProcessParameters(TypeMapper typeMapper, bool validateValues, CommandType commandType)
     {
         HasOutputParameters = false;
         PlaceholderType = PlaceholderType.NoParameters;
@@ -705,8 +706,8 @@ public sealed class NpgsqlParameterCollection : DbParameterCollection, IList<Npg
             case PlaceholderType.Mixed:
                 break;
             default:
-                throw new ArgumentOutOfRangeException(
-                    nameof(PlaceholderType), $"Unknown {nameof(PlaceholderType)} value: {PlaceholderType}");
+                ThrowHelper.ThrowArgumentOutOfRangeException(nameof(PlaceholderType), $"Unknown {nameof(PlaceholderType)} value: {{0}}", PlaceholderType);
+                break;
             }
 
             switch (p.Direction)
@@ -715,14 +716,14 @@ public sealed class NpgsqlParameterCollection : DbParameterCollection, IList<Npg
                 break;
 
             case ParameterDirection.InputOutput:
-                if (PlaceholderType == PlaceholderType.Positional)
-                    throw new NotSupportedException("Output parameters are not supported in positional mode");
+                if (PlaceholderType == PlaceholderType.Positional && commandType != CommandType.StoredProcedure)
+                    ThrowHelper.ThrowNotSupportedException("Output parameters are not supported in positional mode (unless used with CommandType.StoredProcedure)");
                 HasOutputParameters = true;
                 break;
 
             case ParameterDirection.Output:
-                if (PlaceholderType == PlaceholderType.Positional)
-                    throw new NotSupportedException("Output parameters are not supported in positional mode");
+                if (PlaceholderType == PlaceholderType.Positional && commandType != CommandType.StoredProcedure)
+                    ThrowHelper.ThrowNotSupportedException("Output parameters are not supported in positional mode (unless used with CommandType.StoredProcedure)");
                 HasOutputParameters = true;
                 continue;
 
@@ -731,13 +732,14 @@ public sealed class NpgsqlParameterCollection : DbParameterCollection, IList<Npg
                 continue;
 
             default:
-                throw new ArgumentOutOfRangeException(nameof(ParameterDirection),
-                    $"Unhandled {nameof(ParameterDirection)} value: {p.Direction}");
+                ThrowHelper.ThrowArgumentOutOfRangeException(nameof(ParameterDirection),
+                    $"Unhandled {nameof(ParameterDirection)} value: {{0}}", p.Direction);
+                break;
             }
 
             p.Bind(typeMapper);
 
-            if (validate)
+            if (validateValues)
             {
                 p.LengthCache?.Clear();
                 p.ValidateAndGetLength();
@@ -749,10 +751,18 @@ public sealed class NpgsqlParameterCollection : DbParameterCollection, IList<Npg
     internal PlaceholderType PlaceholderType { get; set; }
 
     static NpgsqlParameter Cast(object? value)
-        => value is NpgsqlParameter p
-            ? p
-            : throw new InvalidCastException(
-                $"The value \"{value}\" is not of type \"{nameof(NpgsqlParameter)}\" and cannot be used in this parameter collection.");
+    {
+        var castedValue = value as NpgsqlParameter;
+        if (castedValue is null)
+            ThrowInvalidCastException(value);
+
+        return castedValue;
+    }
+
+    [DoesNotReturn]
+    static void ThrowInvalidCastException(object? value) =>
+        throw new InvalidCastException(
+            $"The value \"{value}\" is not of type \"{nameof(NpgsqlParameter)}\" and cannot be used in this parameter collection.");
 }
 
 enum PlaceholderType

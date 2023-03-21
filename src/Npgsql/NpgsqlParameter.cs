@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Npgsql.Internal;
 using Npgsql.Internal.TypeHandling;
+using Npgsql.Internal.TypeMapping;
 using Npgsql.PostgresTypes;
 using Npgsql.TypeMapping;
 using Npgsql.Util;
@@ -347,7 +348,7 @@ public class NpgsqlParameter : DbParameter, IDbDataParameter, ICloneable
     [DbProviderSpecificTypeProperty(true)]
     public NpgsqlDbType NpgsqlDbType
     {
-        [RequiresUnreferencedCodeAttribute("The NpgsqlDbType getter isn't trimming-safe")]
+        [RequiresUnreferencedCode("The NpgsqlDbType getter isn't trimming-safe")]
         get
         {
             if (_npgsqlDbType.HasValue)
@@ -505,22 +506,33 @@ public class NpgsqlParameter : DbParameter, IDbDataParameter, ICloneable
 
     #region Internals
 
-    internal virtual void ResolveHandler(ConnectorTypeMapper typeMapper)
+    internal virtual void ResolveHandler(TypeMapper typeMapper)
     {
         if (Handler is not null)
             return;
 
-        if (_npgsqlDbType.HasValue)
-            Handler = typeMapper.ResolveByNpgsqlDbType(_npgsqlDbType.Value);
-        else if (_dataTypeName is not null)
-            Handler = typeMapper.ResolveByDataTypeName(_dataTypeName);
-        else if (_value is not null)
-            Handler = typeMapper.ResolveByValue(_value);
-        else
-            throw new InvalidOperationException($"Parameter '{ParameterName}' must have its value set");
+        Resolve(typeMapper);
+
+        void Resolve(TypeMapper typeMapper)
+        {
+            if (_npgsqlDbType.HasValue)
+                Handler = typeMapper.ResolveByNpgsqlDbType(_npgsqlDbType.Value);
+            else if (_dataTypeName is not null)
+                Handler = typeMapper.ResolveByDataTypeName(_dataTypeName);
+            else if (_value is not null)
+                Handler = typeMapper.ResolveByValue(_value);
+            else
+                ThrowInvalidOperationException();
+        }
+
+        void ThrowInvalidOperationException()
+        {
+            var parameterName = !string.IsNullOrEmpty(ParameterName) ? ParameterName : $"${Collection?.IndexOf(this) + 1}";
+            ThrowHelper.ThrowInvalidOperationException($"Parameter '{parameterName}' must have either its NpgsqlDbType or its DataTypeName or its Value set");
+        }
     }
 
-    internal void Bind(ConnectorTypeMapper typeMapper)
+    internal void Bind(TypeMapper typeMapper)
     {
         ResolveHandler(typeMapper);
         FormatCode = Handler!.PreferTextWrite ? FormatCode.Text : FormatCode.Binary;
@@ -531,7 +543,7 @@ public class NpgsqlParameter : DbParameter, IDbDataParameter, ICloneable
         if (_value is DBNull)
             return 0;
         if (_value == null)
-            throw new InvalidCastException($"Parameter {ParameterName} must be set");
+            ThrowHelper.ThrowInvalidCastException("Parameter {0} must be set", ParameterName);
 
         var lengthCache = LengthCache;
         var len = Handler!.ValidateObjectAndGetLength(_value, ref lengthCache, this);

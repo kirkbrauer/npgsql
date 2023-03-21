@@ -215,6 +215,31 @@ public class NodaTimeTests : TestBase
             "tstzrange",
             NpgsqlDbType.TimestampTzRange);
 
+    [Test]
+    public Task Tstzrange_with_no_end_as_Interval()
+        => AssertType(
+            new Interval(
+                new LocalDateTime(1998, 4, 12, 13, 26, 38).InUtc().ToInstant(), null),
+            @"[""1998-04-12 15:26:38+02"",)",
+            "tstzrange",
+            NpgsqlDbType.TimestampTzRange);
+
+    [Test]
+    public Task Tstzrange_with_no_start_as_Interval()
+        => AssertType(
+            new Interval( null,
+                new LocalDateTime(1998, 4, 12, 13, 26, 38).InUtc().ToInstant()),
+            @"(,""1998-04-12 15:26:38+02"")",
+            "tstzrange",
+            NpgsqlDbType.TimestampTzRange);
+
+    [Test]
+    public Task Tstzrange_with_no_start_or_end_as_Interval()
+        => AssertType(
+            new Interval(null, null),
+            @"(,)",
+            "tstzrange",
+            NpgsqlDbType.TimestampTzRange);
 
     [Test]
     public Task Tstzrange_as_NpgsqlRange_of_Instant()
@@ -350,8 +375,17 @@ public class NodaTimeTests : TestBase
                 new Interval(
                     new LocalDateTime(1998, 4, 13, 13, 26, 38).InUtc().ToInstant(),
                     new LocalDateTime(1998, 4, 13, 15, 26, 38).InUtc().ToInstant()),
+                new Interval(
+                    new LocalDateTime(1998, 4, 13, 13, 26, 38).InUtc().ToInstant(),
+                    null),
+                new Interval(
+                    null,
+                    new LocalDateTime(1998, 4, 13, 13, 26, 38).InUtc().ToInstant()),
+                new Interval(
+                    null,
+                    null)
             },
-            @"{""[\""1998-04-12 15:26:38+02\"",\""1998-04-12 17:26:38+02\"")"",""[\""1998-04-13 15:26:38+02\"",\""1998-04-13 17:26:38+02\"")""}",
+            @"{""[\""1998-04-12 15:26:38+02\"",\""1998-04-12 17:26:38+02\"")"",""[\""1998-04-13 15:26:38+02\"",\""1998-04-13 17:26:38+02\"")"",""[\""1998-04-13 15:26:38+02\"",)"",""(,\""1998-04-13 15:26:38+02\"")"",""(,)""}",
             "tstzrange[]",
             NpgsqlDbType.TimestampTzRange | NpgsqlDbType.Array,
             isDefaultForWriting: false);
@@ -541,10 +575,9 @@ public class NodaTimeTests : TestBase
     public async Task TimeTz_as_DateTimeOffset()
     {
         await AssertTypeRead(
-            new DateTimeOffset(1, 1, 2, 13, 3, 45, 510, TimeSpan.FromHours(2)),
             "13:03:45.51+02",
             "time with time zone",
-            isDefault: false);
+            new DateTimeOffset(1, 1, 2, 13, 3, 45, 510, TimeSpan.FromHours(2)), isDefault: false);
 
         await AssertTypeWrite(
             new DateTimeOffset(1, 1, 1, 13, 3, 45, 510, TimeSpan.FromHours(2)),
@@ -613,14 +646,14 @@ public class NodaTimeTests : TestBase
 
     #region Support
 
-    protected override async ValueTask<NpgsqlConnection> OpenConnectionAsync(string? connectionString = null)
+    protected override async ValueTask<NpgsqlConnection> OpenConnectionAsync()
     {
-        var conn = await base.OpenConnectionAsync(connectionString);
+        var conn = await base.OpenConnectionAsync();
         await conn.ExecuteNonQueryAsync("SET TimeZone='Europe/Berlin'");
         return conn;
     }
 
-    protected override NpgsqlConnection OpenConnection(string? connectionString = null)
+    protected override NpgsqlConnection OpenConnection()
         => throw new NotSupportedException();
 
     #endregion Support

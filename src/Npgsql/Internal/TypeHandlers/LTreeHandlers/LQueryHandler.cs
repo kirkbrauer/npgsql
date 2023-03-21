@@ -32,10 +32,8 @@ public class LQueryHandler : TextHandler
     public override int ValidateAndGetLength(char[] value, ref NpgsqlLengthCache? lengthCache, NpgsqlParameter? parameter) =>
         base.ValidateAndGetLength(value, ref lengthCache, parameter) + 1;
 
-
     public override int ValidateAndGetLength(ArraySegment<char> value, ref NpgsqlLengthCache? lengthCache, NpgsqlParameter? parameter) =>
         base.ValidateAndGetLength(value, ref lengthCache, parameter) + 1;
-
 
     public override async Task Write(string value, NpgsqlWriteBuffer buf, NpgsqlLengthCache? lengthCache, NpgsqlParameter? parameter, bool async, CancellationToken cancellationToken = default)
     {
@@ -81,12 +79,12 @@ public class LQueryHandler : TextHandler
 
     #endregion
 
-    public override TextReader GetTextReader(Stream stream)
+    public override TextReader GetTextReader(Stream stream, NpgsqlReadBuffer buffer)
     {
         var version = stream.ReadByte();
         if (version != LQueryProtocolVersion)
             throw new NpgsqlException($"Don't know how to decode lquery with wire format {version}, your connection is now broken");
 
-        return base.GetTextReader(stream);
+        return base.GetTextReader(stream, buffer);
     }
 }

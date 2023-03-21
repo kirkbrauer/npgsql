@@ -14,35 +14,31 @@ using static Npgsql.Util.Statics;
 
 namespace Npgsql.TypeMapping;
 
-sealed class GlobalTypeMapper : TypeMapperBase
+sealed class GlobalTypeMapper : INpgsqlTypeMapper
 {
     public static GlobalTypeMapper Instance { get; }
 
-    internal List<TypeHandlerResolverFactory> ResolverFactories { get; } = new();
+    public INpgsqlNameTranslator DefaultNameTranslator { get; set; } = new NpgsqlSnakeCaseNameTranslator();
+
+    internal List<TypeHandlerResolverFactory> HandlerResolverFactories { get; } = new();
+    List<TypeMappingResolver> MappingResolvers { get; } = new();
     public ConcurrentDictionary<string, IUserTypeMapping> UserTypeMappings { get; } = new();
 
     readonly ConcurrentDictionary<Type, TypeMappingInfo> _mappingsByClrType = new();
 
-    /// <summary>
-    /// A counter that is incremented whenever a global mapping change occurs.
-    /// Used to invalidate bound type mappers.
-    /// </summary>
-    internal int ChangeCounter => _changeCounter;
-
     internal ReaderWriterLockSlim Lock { get; }
         = new(LockRecursionPolicy.SupportsRecursion);
-
-    int _changeCounter;
 
     static GlobalTypeMapper()
         => Instance = new GlobalTypeMapper();
 
-    GlobalTypeMapper() : base(new NpgsqlSnakeCaseNameTranslator())
+    GlobalTypeMapper()
         => Reset();
 
     #region Mapping management
 
-    public override INpgsqlTypeMapper MapEnum<TEnum>(string? pgName = null, INpgsqlNameTranslator? nameTranslator = null)
+    public INpgsqlTypeMapper MapEnum<TEnum>(string? pgName = null, INpgsqlNameTranslator? nameTranslator = null)
+        where TEnum : struct, Enum
     {
         if (pgName != null && pgName.Trim() == "")
             throw new ArgumentException("pgName can't be empty", nameof(pgName));
@@ -63,7 +59,8 @@ sealed class GlobalTypeMapper : TypeMapperBase
         }
     }
 
-    public override bool UnmapEnum<TEnum>(string? pgName = null, INpgsqlNameTranslator? nameTranslator = null)
+    public bool UnmapEnum<TEnum>(string? pgName = null, INpgsqlNameTranslator? nameTranslator = null)
+        where TEnum : struct, Enum
     {
         if (pgName != null && pgName.Trim() == "")
             throw new ArgumentException("pgName can't be empty", nameof(pgName));
@@ -88,7 +85,8 @@ sealed class GlobalTypeMapper : TypeMapperBase
         }
     }
 
-    public override INpgsqlTypeMapper MapComposite<T>(string? pgName = null, INpgsqlNameTranslator? nameTranslator = null)
+    [RequiresUnreferencedCode("Composite type mapping currently isn't trimming-safe.")]
+    public INpgsqlTypeMapper MapComposite<T>(string? pgName = null, INpgsqlNameTranslator? nameTranslator = null)
     {
         if (pgName != null && pgName.Trim() == "")
             throw new ArgumentException("pgName can't be empty", nameof(pgName));
@@ -109,7 +107,8 @@ sealed class GlobalTypeMapper : TypeMapperBase
         }
     }
 
-    public override INpgsqlTypeMapper MapComposite(Type clrType, string? pgName = null, INpgsqlNameTranslator? nameTranslator = null)
+    [RequiresUnreferencedCode("Composite type mapping currently isn't trimming-safe.")]
+    public INpgsqlTypeMapper MapComposite(Type clrType, string? pgName = null, INpgsqlNameTranslator? nameTranslator = null)
     {
         var openMethod = typeof(GlobalTypeMapper).GetMethod(nameof(MapComposite), new[] { typeof(string), typeof(INpgsqlNameTranslator) })!;
         var method = openMethod.MakeGenericMethod(clrType);
@@ -118,10 +117,12 @@ sealed class GlobalTypeMapper : TypeMapperBase
         return this;
     }
 
-    public override bool UnmapComposite<T>(string? pgName = null, INpgsqlNameTranslator? nameTranslator = null)
+    [RequiresUnreferencedCode("Composite type mapping currently isn't trimming-safe.")]
+    public bool UnmapComposite<T>(string? pgName = null, INpgsqlNameTranslator? nameTranslator = null)
         => UnmapComposite(typeof(T), pgName, nameTranslator);
 
-    public override bool UnmapComposite(Type clrType, string? pgName = null, INpgsqlNameTranslator? nameTranslator = null)
+    [RequiresUnreferencedCode("Composite type mapping currently isn't trimming-safe.")]
+    public bool UnmapComposite(Type clrType, string? pgName = null, INpgsqlNameTranslator? nameTranslator = null)
     {
         if (pgName != null && pgName.Trim() == "")
             throw new ArgumentException("pgName can't be empty", nameof(pgName));
@@ -146,7 +147,7 @@ sealed class GlobalTypeMapper : TypeMapperBase
         }
     }
 
-    public override void AddTypeResolverFactory(TypeHandlerResolverFactory resolverFactory)
+    public void AddTypeResolverFactory(TypeHandlerResolverFactory resolverFactory)
     {
         Lock.EnterWriteLock();
         try
@@ -155,16 +156,20 @@ sealed class GlobalTypeMapper : TypeMapperBase
             // we replace an existing resolver of the same CLR type.
             var type = resolverFactory.GetType();
 
-            if (ResolverFactories[0].GetType() == type)
-                ResolverFactories[0] = resolverFactory;
+            if (HandlerResolverFactories[0].GetType() == type)
+                HandlerResolverFactories[0] = resolverFactory;
             else
             {
-                for (var i = 0; i < ResolverFactories.Count; i++)
-                    if (ResolverFactories[i].GetType() == type)
-                        ResolverFactories.RemoveAt(i);
+                for (var i = 0; i < HandlerResolverFactories.Count; i++)
+                    if (HandlerResolverFactories[i].GetType() == type)
+                        HandlerResolverFactories.RemoveAt(i);
 
-                ResolverFactories.Insert(0, resolverFactory);
+                HandlerResolverFactories.Insert(0, resolverFactory);
             }
+
+            var mappingResolver = resolverFactory.CreateMappingResolver();
+            if (mappingResolver is not null)
+                AddMappingResolver(mappingResolver, overwrite: true);
 
             RecordChange();
         }
@@ -174,13 +179,66 @@ sealed class GlobalTypeMapper : TypeMapperBase
         }
     }
 
-    public override void Reset()
+    internal void TryAddMappingResolver(TypeMappingResolver resolver)
     {
         Lock.EnterWriteLock();
         try
         {
-            ResolverFactories.Clear();
-            ResolverFactories.Add(new BuiltInTypeHandlerResolverFactory());
+            // For global mapper resolvers we don't need to overwrite them in case we add another of the same type
+            // because they shouldn't have a state.
+            // The only exception is whenever a user adds a resolver factory to global type mapper specifically.
+            // In that case we create a local mapper resolver and always overwrite the one we already have
+            // as it can have settings (e.g. json serialization)
+            if (AddMappingResolver(resolver, overwrite: false))
+                RecordChange();
+        }
+        finally
+        {
+            Lock.ExitWriteLock();
+        }
+    }
+
+    bool AddMappingResolver(TypeMappingResolver resolver, bool overwrite)
+    {
+        // Since EFCore.PG plugins (and possibly other users) repeatedly call NpgsqlConnection.GlobalTypeMapped.UseNodaTime,
+        // we replace an existing resolver of the same CLR type.
+        var type = resolver.GetType();
+
+        if (MappingResolvers[0].GetType() == type)
+        {
+            if (!overwrite)
+                return false;
+            MappingResolvers[0] = resolver;
+        }
+        else
+        {
+            for (var i = 0; i < MappingResolvers.Count; i++)
+            {
+                if (MappingResolvers[i].GetType() == type)
+                {
+                    if (!overwrite)
+                        return false;
+                    MappingResolvers.RemoveAt(i);
+                    break;
+                }
+            }
+
+            MappingResolvers.Insert(0, resolver);
+        }
+
+        return true;
+    }
+
+    public void Reset()
+    {
+        Lock.EnterWriteLock();
+        try
+        {
+            HandlerResolverFactories.Clear();
+            HandlerResolverFactories.Add(new BuiltInTypeHandlerResolverFactory());
+
+            MappingResolvers.Clear();
+            MappingResolvers.Add(new BuiltInTypeMappingResolver());
 
             UserTypeMappings.Clear();
 
@@ -193,16 +251,17 @@ sealed class GlobalTypeMapper : TypeMapperBase
     }
 
     internal void RecordChange()
-    {
-        _mappingsByClrType.Clear();
-        Interlocked.Increment(ref _changeCounter);
-    }
+        => _mappingsByClrType.Clear();
+
+    static string GetPgName(Type clrType, INpgsqlNameTranslator nameTranslator)
+        => clrType.GetCustomAttribute<PgNameAttribute>()?.PgName
+           ?? nameTranslator.TranslateTypeName(clrType.Name);
 
     #endregion Mapping management
 
     #region NpgsqlDbType/DbType inference for NpgsqlParameter
 
-    [RequiresUnreferencedCodeAttribute("ToNpgsqlDbType uses interface-based reflection and isn't trimming-safe")]
+    [RequiresUnreferencedCode("ToNpgsqlDbType uses interface-based reflection and isn't trimming-safe")]
     internal bool TryResolveMappingByValue(object value, [NotNullWhen(true)] out TypeMappingInfo? typeMapping)
     {
         Lock.EnterReadLock();
@@ -218,11 +277,11 @@ sealed class GlobalTypeMapper : TypeMapperBase
             if (_mappingsByClrType.TryGetValue(type, out typeMapping))
                 return true;
 
-            foreach (var resolverFactory in ResolverFactories)
-                if ((typeMapping = resolverFactory.GetMappingByValueDependentValue(value)) is not null)
+            foreach (var resolver in MappingResolvers)
+                if ((typeMapping = resolver.GetMappingByValueDependentValue(value)) is not null)
                     return true;
 
-            return TryResolveMappingByClrType(value.GetType(), out typeMapping);
+            return TryResolveMappingByClrType(type, out typeMapping);
         }
         finally
         {
@@ -234,9 +293,9 @@ sealed class GlobalTypeMapper : TypeMapperBase
             if (_mappingsByClrType.TryGetValue(clrType, out typeMapping))
                 return true;
 
-            foreach (var resolverFactory in ResolverFactories)
+            foreach (var resolver in MappingResolvers)
             {
-                if ((typeMapping = resolverFactory.GetMappingByClrType(clrType)) is not null)
+                if ((typeMapping = resolver.GetMappingByClrType(clrType)) is not null)
                 {
                     _mappingsByClrType[clrType] = typeMapping;
                     return true;
