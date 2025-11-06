@@ -609,8 +609,7 @@ public sealed partial class NpgsqlConnector
                 // Any error after trying with GSS encryption
                 (gssEncMode == GssEncryptionMode.Prefer ||
                 // Auth error with/without SSL
-                (e is PostgresException { SqlState: PostgresErrorCodes.InvalidAuthorizationSpecification } &&
-                 (sslMode == SslMode.Prefer && conn.IsSslEncrypted || sslMode == SslMode.Allow && !conn.IsSslEncrypted)))
+                (sslMode == SslMode.Prefer && conn.IsSslEncrypted || sslMode == SslMode.Allow && !conn.IsSslEncrypted))
             {
                 if (gssEncMode == GssEncryptionMode.Prefer)
                 {
@@ -1128,7 +1127,7 @@ public sealed partial class NpgsqlConnector
             var checkCertificateRevocation = Settings.CheckCertificateRevocation;
 
             RemoteCertificateValidationCallback? certificateValidationCallback;
-            X509Certificate2? caCert;
+            X509Certificate2Collection? caCerts;
             string? certRootPath = null;
 
             if (sslMode is SslMode.Prefer or SslMode.Require)
@@ -1136,11 +1135,11 @@ public sealed partial class NpgsqlConnector
                 certificateValidationCallback = SslTrustServerValidation;
                 checkCertificateRevocation = false;
             }
-            else if ((caCert = DataSource.TransportSecurityHandler.RootCertificateCallback?.Invoke()) is not null ||
+            else if (((caCerts = DataSource.TransportSecurityHandler.RootCertificatesCallback?.Invoke()) is not null && caCerts.Count > 0) ||
                      (certRootPath = Settings.RootCertificate ??
                                      PostgresEnvironment.SslCertRoot ?? PostgresEnvironment.SslCertRootDefault) is not null)
             {
-                certificateValidationCallback = SslRootValidation(sslMode == SslMode.VerifyFull, certRootPath, caCert);
+                certificateValidationCallback = SslRootValidation(sslMode == SslMode.VerifyFull, certRootPath, caCerts);
             }
             else if (sslMode == SslMode.VerifyCA)
             {
@@ -1196,7 +1195,7 @@ public sealed partial class NpgsqlConnector
                     if (Settings.RootCertificate is not null)
                         throw new ArgumentException(NpgsqlStrings.CannotUseSslRootCertificateWithCustomValidationCallback);
 
-                    if (DataSource.TransportSecurityHandler.RootCertificateCallback is not null)
+                    if (DataSource.TransportSecurityHandler.RootCertificatesCallback is not null)
                         throw new ArgumentException(NpgsqlStrings.CannotUseValidationRootCertificateCallbackWithCustomValidationCallback);
                 }
             }
@@ -1316,9 +1315,6 @@ public sealed partial class NpgsqlConnector
 
     async Task ConnectAsync(NpgsqlTimeout timeout, CancellationToken cancellationToken)
     {
-        // Whether the framework and/or the OS platform support Dns.GetHostAddressesAsync cancellation API or they do not,
-        // we always fake-cancel the operation with the help of TaskTimeoutAndCancellation.ExecuteAsync. It stops waiting
-        // and raises the exception, while the actual task may be left running.
         EndPoint[] endpoints;
         if (NpgsqlConnectionStringBuilder.IsUnixSocket(Host, Port, out var socketPath))
         {
@@ -1329,8 +1325,18 @@ public sealed partial class NpgsqlConnector
             IPAddress[] ipAddresses;
             try
             {
-                ipAddresses = await Dns.GetHostAddressesAsync(Host, cancellationToken)
-                    .WaitAsync(timeout.CheckAndGetTimeLeft(), cancellationToken).ConfigureAwait(false);
+                using var combinedCts = timeout.IsSet ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken) : null;
+                combinedCts?.CancelAfter(timeout.CheckAndGetTimeLeft());
+                var combinedToken = combinedCts?.Token ?? cancellationToken;
+                try
+                {
+                    ipAddresses = await Dns.GetHostAddressesAsync(Host,  combinedToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException oce) when (
+                    oce.CancellationToken == combinedToken && !cancellationToken.IsCancellationRequested)
+                {
+                    throw new TimeoutException();
+                }
             }
             catch (SocketException ex)
             {
@@ -1362,7 +1368,18 @@ public sealed partial class NpgsqlConnector
                 // Some options are not applied after the socket is open, see #6013
                 SetSocketOptions(socket);
 
-                await OpenSocketConnectionAsync(socket, endpoint, endpointTimeout, cancellationToken).ConfigureAwait(false);
+                using var combinedCts = endpointTimeout.IsSet ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken) : null;
+                combinedCts?.CancelAfter(endpointTimeout.CheckAndGetTimeLeft());
+                var combinedToken = combinedCts?.Token ?? cancellationToken;
+                try
+                {
+                    await socket.ConnectAsync(endpoint, combinedToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException oce) when (
+                    oce.CancellationToken == combinedToken && !cancellationToken.IsCancellationRequested)
+                {
+                    throw new TimeoutException();
+                }
 
                 _socket = socket;
                 ConnectedEndPoint = endpoint;
@@ -1389,16 +1406,6 @@ public sealed partial class NpgsqlConnector
                 if (i == endpoints.Length - 1)
                     throw new NpgsqlException($"Failed to connect to {endpoint}", e);
             }
-        }
-
-        static Task OpenSocketConnectionAsync(Socket socket, EndPoint endpoint, NpgsqlTimeout perIpTimeout, CancellationToken cancellationToken)
-        {
-            // Whether the OS platform supports Socket.ConnectAsync cancellation API or not,
-            // we always fake-cancel the operation with the help of TaskTimeoutAndCancellation.ExecuteAsync. It stops waiting
-            // and raises the exception, while the actual task may be left running.
-            Task ConnectAsync(CancellationToken ct) =>
-                socket.ConnectAsync(endpoint, ct).AsTask();
-            return TaskTimeoutAndCancellation.ExecuteAsync(ConnectAsync, perIpTimeout, cancellationToken);
         }
     }
 
@@ -1977,7 +1984,7 @@ public sealed partial class NpgsqlConnector
         (sender, certificate, chain, sslPolicyErrors)
             => true;
 
-    static RemoteCertificateValidationCallback SslRootValidation(bool verifyFull, string? certRootPath, X509Certificate2? caCertificate)
+    static RemoteCertificateValidationCallback SslRootValidation(bool verifyFull, string? certRootPath, X509Certificate2Collection? caCertificates)
         => (_, certificate, chain, sslPolicyErrors) =>
         {
             if (certificate is null || chain is null)
@@ -1994,12 +2001,12 @@ public sealed partial class NpgsqlConnector
 
             if (certRootPath is null)
             {
-                Debug.Assert(caCertificate is not null);
-                certs.Add(caCertificate);
+                Debug.Assert(caCertificates is { Count: > 0 });
+                certs.AddRange(caCertificates);
             }
             else
             {
-                Debug.Assert(caCertificate is null);
+                Debug.Assert(caCertificates is null or { Count: > 0 });
                 if (Path.GetExtension(certRootPath).ToUpperInvariant() != ".PFX")
                     certs.ImportFromPemFile(certRootPath);
 
